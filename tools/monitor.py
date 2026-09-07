@@ -9,9 +9,22 @@ from scripts. It can also send calibration keystrokes.
   tools/monitor.py 6 --send r         # press 'r' (next rotation), then watch
   tools/monitor.py 6 --send di        # 'd' then 'i'
 """
-import sys, time, serial
+import os, sys, time, serial
 
-PORT = "/dev/cu.usbmodem5C380098851"
+# The board has two USB-C ports and they enumerate under different names, so
+# auto-detect rather than hard-coding one. Override with MLUVITKO_PORT.
+def _find_port():
+    import glob
+    if os.environ.get("MLUVITKO_PORT"):
+        return os.environ["MLUVITKO_PORT"]
+    ports = sorted(p for p in glob.glob("/dev/cu.usbmodem*")
+                   if "debug-console" not in p)
+    if not ports:
+        sys.exit("No /dev/cu.usbmodem* found -- is the board plugged in?")
+    return ports[0]
+
+
+PORT = _find_port()
 BAUD = 115200
 
 args  = sys.argv[1:]

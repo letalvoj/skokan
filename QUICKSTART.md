@@ -18,8 +18,19 @@ see [README](README.md#hardware) for why there are two). On macOS:
 ls /dev/cu.usbmodem*
 ```
 
-If the path differs from `/dev/cu.usbmodem5C380098851`, update `upload_port`
-and `monitor_port` in `platformio.ini`, and `PORT` in `tools/monitor.py`.
+**The two ports enumerate under different names**, and the name changes
+between sessions, so don't trust a hard-coded one:
+
+- CH343 bridge (`1a86:55d3`) — e.g. `/dev/cu.usbmodem5C380098851`. This is
+  the one `Serial` comes out of in every build except `game_usb`.
+- Native USB (`303a:1001`, "USB JTAG/serial debug unit") — e.g.
+  `/dev/cu.usbmodem101`. Flashing works here too, but you get **no console**
+  unless you flash `game_usb`.
+
+Check which one you have with `system_profiler SPUSBDataType | grep -i -B2
+"303a\|1a86"`. `tools/monitor.py` auto-detects (override with
+`MLUVITKO_PORT=/dev/cu.usbmodemXXX`); for flashing, pass
+`--upload-port /dev/cu.usbmodemXXX` if PlatformIO picks the wrong one.
 
 Sanity-check the board is alive:
 

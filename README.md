@@ -155,6 +155,7 @@ remain useful if something regresses:
 | `step3` | everything — this **is** the current app | the real thing |
 | `mluvitko` (default) | same as `step3` | `pio run -t upload` with no `-e` flag |
 | `game` | **SKOKAN**, the one-button platform game (display + button + speaker, no mic) | `pio run -e game -t upload` |
+| `game_usb` | same game, but `Serial` on the **native USB** port instead of the CH343 one | when the cable is in the other USB-C and you want the console |
 
 ### Source layout
 
@@ -296,22 +297,34 @@ front of them (`coinArc()` integrates the same physics). Collecting the coins
 
 The play field is composed off-screen into a 320×176 `GFXcanvas16` (in
 internal SRAM, PSRAM as fallback) and pushed in **one bulk SPI transfer**.
-That transfer is the entire frame budget:
+That transfer dominates the frame budget:
 
 ```
-320 × 176 × 2 bytes = 112,640 B → ~45 ms at 20 MHz SPI  → ~20 fps
+320 × 176 × 2 bytes = 112,640 B → 45 ms of SPI at 20 MHz
 ```
 
-A full 320×240 screen would be ~61 ms before any drawing, which is why the
-HUD (top 22 px) and the grid apron (bottom 42 px) sit *outside* the canvas
-and are redrawn only when they change. Movement is scaled by measured `dt`,
-so the game runs at the same speed whatever frame rate it actually achieves.
-Frame timing is printed to serial every 40 frames.
+Measured on the board (`[game] ... fps` on serial every 40 frames):
 
-Press **`f`** to switch the SPI clock to 40 MHz, which roughly doubles the
-frame rate — 20 MHz is the safe breadboard default (see
-[Learnings](#learnings)), so if the picture tears or flashes, press `f` again
-to go back.
+| SPI clock | render | blit | frame | fps |
+|---|---|---|---|---|
+| 20 MHz (default) | 12.3 ms | 45.0 ms | 57.3 ms | **17.5** |
+| 40 MHz (press `f`) | 12.3 ms | 22.5 ms | 34.8 ms | **28.7** |
+
+The 22.5 ms the clock change saves is exactly the theoretical SPI saving, so
+the blit runs at full wire speed and the remaining 12.3 ms is drawing. A full
+320×240 screen would cost ~61 ms of SPI before any drawing at all, which is
+why the HUD (top 22 px) and the ground apron (bottom 42 px) sit *outside* the
+canvas and are redrawn only when they change.
+
+Movement is scaled by measured `dt`, so the game runs at the same speed
+whatever frame rate it achieves — the clock change makes it smoother, not
+faster.
+
+**`f`** toggles the SPI clock between 20 and 40 MHz live. 20 MHz is the safe
+breadboard default (see [Learnings](#learnings)); if 40 MHz tears or flashes
+on your wiring, press `f` again. Next cheapest win beyond that is
+dirty-rectangle blitting, since the sky above the mountains changes very
+little between frames.
 
 ### Seeing it without a board
 

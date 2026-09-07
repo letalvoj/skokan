@@ -6,10 +6,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# Optional label, so a snapshot can say what it was rather than only when it
+# was:  ./tools/backup_firmware.sh skokan-flashed
+label="${1:-}"
 commit=$(git rev-parse --short HEAD 2>/dev/null || echo "nogit")
 dirty=$(git diff --quiet 2>/dev/null || echo "-dirty")
 stamp=$(date +%Y%m%d-%H%M%S)
-dest="firmware_backups/${stamp}_${commit}${dirty}"
+dest="firmware_backups/${stamp}_${commit}${dirty}${label:+_$label}"
 mkdir -p "$dest"
 
 found=0
