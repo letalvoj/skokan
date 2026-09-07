@@ -219,6 +219,12 @@ Press the arcade button:
 neon platform runner: the screen turns landscape, the runner never stops, and
 the arcade button is the entire control scheme.
 
+![SKOKAN title screen](docs/skokan-title.png)
+![SKOKAN gameplay](docs/skokan-play.png)
+
+*(Both frames are the real render, captured from the desktop harness — see
+[Seeing it without a board](#seeing-it-without-a-board).)*
+
 ### Controls
 
 | Button | Result |
@@ -306,6 +312,25 @@ Press **`f`** to switch the SPI clock to 40 MHz, which roughly doubles the
 frame rate — 20 MHz is the safe breadboard default (see
 [Learnings](#learnings)), so if the picture tears or flashes, press `f` again
 to go back.
+
+### Seeing it without a board
+
+```bash
+./host/shots.sh
+```
+
+builds the **same** `src/game.cpp` as a macOS binary against a handful of
+Arduino shims, plays it with an autopilot on a fake clock, and writes PNG
+frames to `host/shots/`. The graphics are not mocked — it compiles the real
+`Adafruit_GFX.cpp`, so the canvas, the font and every rounded rect behave
+exactly as on the panel; only the SPI push is swapped for a memory buffer.
+
+This is how the game's look was actually developed: render, look, fix. It
+caught the floor grid hanging in the air above the platforms, invisible dark
+birds, spin frames that rendered as yellow bars, and a crate spawn rule whose
+width threshold meant crates never appeared at all. It says nothing about SPI
+timing, amp latency or button bounce — those still need the hardware.
+Details in [host/README.md](host/README.md).
 
 ### Assets
 

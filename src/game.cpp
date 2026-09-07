@@ -33,10 +33,13 @@ static const int16_t PLAY_Y = HUD_H;              // y 22..197   redrawn every f
 static const int16_t PLAY_W = 320, PLAY_H = 176;
 static const int16_t APRON_Y = PLAY_Y + PLAY_H;   // y 198..239  drawn once
 
-// Geometry inside the play band (band-local y).
-static const int16_t HORIZON = 92;
-static const int16_t SUN_X = 244, SUN_Y = 58, SUN_R = 30;
-static const int16_t TOP_MIN = 102, TOP_MAX = 146;   // platform surface range
+// Geometry inside the play band (band-local y). The horizon sits LOW, just
+// above the ground line: a high horizon leaves a wide stripe of floor grid in
+// the air above the platforms, and the runner then looks like it is standing
+// on the grid rather than on the ground it actually collides with.
+static const int16_t HORIZON = 134;
+static const int16_t SUN_X = 244, SUN_Y = 56, SUN_R = 33;
+static const int16_t TOP_MIN = 106, TOP_MAX = 148;   // platform surface range
 
 // ---------------------------------------------------------------------------
 // Palette -- deliberately tiny, 80s arcade.
@@ -97,19 +100,21 @@ static const uint8_t SPR_JUMP[10][8] = {
   {0,3,3,0,0,3,3,0},
   {0,0,0,0,0,0,0,0},
 };
+// Birds are WHITE, not a dark silhouette: they cost a life, and on a dusk
+// background a dark bird is invisible until it has already hit you.
 static const uint8_t SPR_BIRD_A[5][8] = {
-  {7,0,0,0,0,0,0,7},
-  {0,7,7,0,0,7,7,0},
-  {0,0,7,7,7,7,0,0},
-  {0,0,7,2,7,7,7,0},
-  {0,0,0,7,7,0,0,0},
+  {5,0,0,0,0,0,0,5},
+  {0,5,5,0,0,5,5,0},
+  {0,0,5,5,5,5,0,0},
+  {0,0,5,7,5,5,5,0},
+  {0,0,0,5,5,0,0,0},
 };
 static const uint8_t SPR_BIRD_B[5][8] = {
   {0,0,0,0,0,0,0,0},
-  {0,0,7,7,7,7,0,0},
-  {0,7,7,2,7,7,7,0},
-  {0,7,0,7,7,0,7,0},
-  {7,0,0,0,0,0,0,7},
+  {0,0,5,5,5,5,0,0},
+  {0,5,5,7,5,5,5,0},
+  {0,5,0,5,5,0,5,0},
+  {5,0,0,0,0,0,0,5},
 };
 
 static const int16_t PLR_W = 16, PLR_H = 20;   // on-screen size (art 8x10 @ 2x)
@@ -214,6 +219,10 @@ static uint32_t g_lastHud = 0xFFFFFFFF;
 
 // Precomputed background
 static uint16_t skyLUT[PLAY_H];
+// Ground shading, indexed by absolute y so neighbouring platforms at
+// different heights share one consistent light, and the apron below the play
+// band continues it seamlessly instead of looking like a separate surface.
+static uint16_t rockLUT[PLAY_H];
 static const uint16_t MTN_N = 512;
 static uint8_t  mtn[MTN_N];
 
@@ -278,7 +287,9 @@ static void coinArc(float x0, float y0, uint8_t n) {
     const float t = (float)i / (n + 1) * AIRTIME;
     const float dy = (t < T_UP) ? (JUMP_V0 * t + 0.5f * G_UP_HELD * t * t)
                                 : (-JUMP_H + 0.5f * G_DOWN * (t - T_UP) * (t - T_UP));
-    addCoin(x0 + speed * t, y0 + dy - COIN_S);
+    // Flattened to 80% of the true arc: a full held jump still sweeps through
+    // them, but so does a merely decent one, which is the point at this age.
+    addCoin(x0 + speed * t, y0 + dy * 0.80f - COIN_S);
   }
 }
 
@@ -303,18 +314,20 @@ static void addSegment() {
   }
 
   // Wide enough to land, breathe and take off again at the current speed.
-  const float w = fmaxf(60.0f, speed * 0.85f) + frnd(0.0f, 80.0f);
+  const float w = fmaxf(90.0f, speed * 0.90f) + frnd(0.0f, 90.0f);
   if (nseg >= MAX_SEG) return;
   segs[nseg++] = { p.x + p.w + gap, w, top };
   const Seg &s = segs[nseg - 1];
 
-  // Coins over the gap, following the jump that clears it.
-  if (gap > 0.0f) coinArc(p.x + p.w - 6.0f, (float)p.top, 5);
+  // Coins over the gap, following the jump that clears it. The arc starts a
+  // little BEFORE the lip: jumping slightly early is the safe way to clear a
+  // gap, so the coins should reward that rather than punish it.
+  if (gap > 0.0f) coinArc(p.x + p.w - 26.0f, (float)p.top, 4);
 
   // Crates: something to hop over. Never near an edge, where the player is
   // busy landing, and never before level 2.
-  if (level >= 2 && s.w > 150.0f && random(100) < 55) {
-    const float cx = s.x + frnd(55.0f, s.w - 70.0f);
+  if (level >= 2 && s.w > 118.0f && random(100) < 55) {
+    const float cx = s.x + frnd(48.0f, s.w - 58.0f);
     if (ncrate < MAX_CRATE) {
       crates[ncrate++] = { cx, (int16_t)(s.top - CRATE_S) };
       coinArc(cx - 34.0f, (float)s.top, 3);
@@ -381,7 +394,7 @@ static void sfxOver()   { const uint8_t a[] = {69, 65, 62, 57, 50}; synthArp(a, 
 static void puff(float x, float y, uint16_t col, uint8_t n) {
   for (uint8_t i = 0, made = 0; i < MAX_PART && made < n; i++)
     if (parts[i].life == 0) {
-      parts[i] = { x, y, frnd(-70, 70), frnd(-120, -20), (uint8_t)random(12, 22), col };
+      parts[i] = { x, y, frnd(-70, 70), frnd(-110, -20), (uint8_t)random(7, 13), col };
       made++;
     }
 }
@@ -397,11 +410,13 @@ static void newGame() {
   lives = START_LIVES; distance = 0; prevHard = false; birdCombo = 0;
   invuln = 0; coyote = 0; buffered = 0; usedDouble = false; holding = false;
 
-  // Three flat, gapless segments to start on -- nothing to fail at yet.
+  // Three flat, gapless segments to start on -- nothing to fail at yet, and a
+  // low row of coins so the very first thing that happens is a small win.
   segs[nseg++] = { -80.0f, 460.0f, 138 };
   segs[nseg++] = { 380.0f, 300.0f, 138 };
   segs[nseg++] = { 680.0f, 300.0f, 138 };
   py = 138 - PLR_H; vy = 0; grounded = true;
+  for (uint8_t i = 0; i < 4; i++) addCoin(250.0f + i * 20.0f, 138.0f - 32.0f);
   cullAndTop();
 
   g_lastHud = 0xFFFFFFFF;
@@ -621,6 +636,11 @@ static void buildBackgroundTables() {
       skyLUT[y] = lerpRGB(30, 4, 44, 4, 0, 12, t);
     }
   }
+  for (int16_t y = 0; y < PLAY_H; y++) {
+    const float t = constrain((float)(y - TOP_MIN) / (float)(PLAY_H - TOP_MIN),
+                              0.0f, 1.0f);
+    rockLUT[y] = lerpRGB(56, 12, 84, 8, 0, 20, t);   // lit face -> shadow
+  }
   for (uint16_t i = 0; i < MTN_N; i++) {
     const float a = sinf(i * 0.043f) * 12.0f + sinf(i * 0.011f) * 16.0f
                   + sinf(i * 0.131f) * 5.0f;
@@ -651,6 +671,16 @@ static void drawBackground() {
   for (int16_t y = 0; y < PLAY_H; y++)
     cv->drawFastHLine(0, y, PLAY_W, skyLUT[y]);
 
+  // Stars in the deep part of the sky, drifting slower than anything else.
+  // Cheap depth, and it stops the top third being an empty purple slab.
+  const int32_t so = (int32_t)(camX * 0.08f);
+  for (uint8_t i = 0; i < 26; i++) {
+    const int16_t sx = (int16_t)(((i * 71 + 13) - so) % 320 + (so < 0 ? 320 : 0));
+    const int16_t sy = 4 + (i * 37) % 62;
+    if (sx >= 0 && sx < PLAY_W)
+      cv->drawPixel(sx, sy, (i & 3) ? 0x6B5D : C_WHITE);
+  }
+
   drawSun();
 
   // Mountains, drifting slowly (parallax) so depth reads even at 20 fps.
@@ -661,19 +691,22 @@ static void drawBackground() {
     cv->drawPixel(x, HORIZON - h, C_MAG);
   }
 
-  // Perspective floor grid, visible through the pits.
-  for (uint8_t k = 1; k < 10; k++) {
-    const int16_t y = HORIZON + (int16_t)(k * k * 1.1f);
+  // Neon floor grid. Deliberately starts BELOW the lowest platform surface,
+  // so it is only ever seen through a pit -- never as a stripe of fake floor
+  // hanging in the air where the player can't actually stand.
+  const int16_t GRID_TOP = TOP_MAX + 2;
+  for (uint8_t k = 0; k < 8; k++) {
+    const int16_t y = GRID_TOP + 2 + (int16_t)(k * k * 0.9f);
     if (y >= PLAY_H) break;
     cv->drawFastHLine(0, y, PLAY_W, C_GRID);
   }
-  const float vo = fmodf(camX * 0.6f, 44.0f);
-  for (int8_t i = -6; i <= 12; i++) {
-    const float xh = 160.0f + (i * 44.0f - vo - 160.0f) * 0.18f;
-    const float xb = i * 44.0f - vo;
-    for (int16_t y = HORIZON; y < PLAY_H; y += 2) {
-      const float t = (float)(y - HORIZON) / (PLAY_H - HORIZON);
-      cv->drawPixel((int16_t)(xh + (xb - xh) * t * t), y, C_GRID);
+  const float vo = fmodf(camX * 0.6f, 40.0f);
+  for (int8_t i = -4; i <= 12; i++) {
+    const float xb = i * 40.0f - vo;
+    const float xh = 160.0f + (xb - 160.0f) * 0.25f;   // converge on the centre
+    for (int16_t y = GRID_TOP; y < PLAY_H; y++) {
+      const float t = (float)(y - GRID_TOP) / (PLAY_H - GRID_TOP);
+      cv->drawPixel((int16_t)(xh + (xb - xh) * t), y, C_GRID);
     }
   }
 }
@@ -685,11 +718,25 @@ static void drawWorld() {
     const int16_t w = (int16_t)segs[i].w;
     const int16_t t = segs[i].top;
     if (x > PLAY_W || x + w < 0) continue;
-    cv->fillRect(x, t, w, PLAY_H - t, C_ROCK);
-    cv->fillRect(x, t, w, 3, C_CYAN);
+
+    // Front face: shaded by absolute y, so it recedes into shadow towards the
+    // bottom of the screen instead of sitting there as a flat dark slab.
+    for (int16_t y = t; y < PLAY_H; y++) cv->drawFastHLine(x, y, w, rockLUT[y]);
+
+    // Chunky brick hint, only near the lit top -- lower down it would just be
+    // noise in the shadow. These are anchored to the segment, so they scroll.
+    for (int16_t s = x + 8; s < x + w; s += 16)
+      cv->drawFastVLine(s, t + 6, min(30, PLAY_H - t - 6), 0x2807);
+
+    // Receding neon lines under the lip, spaced wider as they go down.
+    const uint16_t glow[3] = { 0x2A7B, 0x195A, 0x1116 };
+    for (uint8_t k = 0; k < 3; k++) {
+      const int16_t y = t + 7 + k * k * 5 + k * 4;
+      if (y < PLAY_H) cv->drawFastHLine(x, y, w, glow[k]);
+    }
+
+    cv->fillRect(x, t, w, 3, C_CYAN);                // the surface itself
     cv->drawFastHLine(x, t + 3, w, 0x03BF);
-    for (int16_t s = x + 8; s < x + w; s += 16)      // chunky brick hint
-      cv->drawFastVLine(s, t + 6, PLAY_H - t - 6, 0x1805);
   }
 
   // Crates
@@ -702,17 +749,20 @@ static void drawWorld() {
     cv->drawLine(x + CRATE_S - 3, y + 2, x + 2, y + CRATE_S - 3, C_DARK);
   }
 
-  // Coins -- a 4-frame spin, faked by squashing the width.
-  const uint8_t f = (millis() / 90) % 4;
-  const int16_t cw[4] = { COIN_S, 8, 4, 8 };
+  // Coins -- a 4-frame spin, faked by squashing the width. Rounded and edged
+  // in orange: a plain squashed rectangle just reads as a yellow bar.
+  const int16_t cw[4] = { COIN_S, 9, 6, 9 };
   for (uint8_t i = 0; i < ncoin; i++) {
     if (!coins[i].alive) continue;
     const int16_t x = (int16_t)(coins[i].x - camX), y = (int16_t)coins[i].y;
     if (x > PLAY_W || x + COIN_S < 0) continue;
-    const int16_t w = cw[f];
-    cv->fillRect(x + (COIN_S - w) / 2, y, w, COIN_S, C_YELLOW);
-    if (w > 4) cv->fillRect(x + (COIN_S - w) / 2 + 2, y + 3, w - 4, COIN_S - 6, C_ORANGE);
-    if (w > 6) cv->fillRect(x + (COIN_S - w) / 2 + 2, y + 3, 2, 3, C_WHITE);
+    // Phase from the coin's own world position, so a row of them does not
+    // spin in lockstep (which reads as a row of identical bars, not coins).
+    const uint8_t f  = (uint8_t)((millis() / 90 + (uint32_t)(coins[i].x * 0.09f)) & 3);
+    const int16_t w  = cw[f], cx = x + (COIN_S - w) / 2;
+    cv->fillRoundRect(cx, y, w, COIN_S, 3, C_YELLOW);
+    cv->drawRoundRect(cx, y, w, COIN_S, 3, C_ORANGE);
+    if (w > 6) cv->fillRect(cx + 2, y + 3, 2, 4, C_WHITE);   // glint
   }
 
   // Birds
@@ -747,47 +797,65 @@ static void drawWorld() {
   } else banner[0] = 0;
 }
 
+// Arcade-style backdrop, so overlay text never has to compete with the sun,
+// a mountain ridge, or a crate that happens to scroll behind a word.
+static void panel(int16_t x, int16_t y, int16_t w, int16_t h) {
+  cv->fillRoundRect(x, y, w, h, 6, 0x1002);
+  cv->drawRoundRect(x, y, w, h, 6, C_MAG);
+  cv->drawRoundRect(x + 2, y + 2, w - 4, h - 4, 5, 0x5809);
+}
+
 static void drawTitle() {
   cv->setTextSize(4);
   cv->setTextColor(C_MAG);   cv->setCursor(58, 28); cv->print(F("SKOKAN"));
   cv->setTextColor(C_CYAN);  cv->setCursor(56, 26); cv->print(F("SKOKAN"));
 
+  // Kept narrow enough to leave the sun's slits showing beside it.
+  panel(20, 64, 200, best ? 60 : 46);
   cv->setTextSize(1);
   cv->setTextColor(C_WHITE);
-  cv->setCursor(74, 70);  cv->print(F("PRESS THE BIG BUTTON TO RUN"));
-  cv->setCursor(74, 84);  cv->print(F("TAP = HOP    HOLD = BIG JUMP"));
-  cv->setCursor(74, 96);  cv->print(F("PRESS IN THE AIR = DOUBLE JUMP"));
+  cv->setCursor(31, 72);  cv->print(F("PRESS THE BIG BUTTON TO RUN!"));
+  cv->setCursor(31, 84);  cv->print(F("TAP = HOP     HOLD = BIG JUMP"));
+  cv->setCursor(31, 96);  cv->print(F("PRESS IN THE AIR = DOUBLE JUMP"));
   if (best) {
     cv->setTextColor(C_YELLOW);
-    cv->setCursor(120, 112); cv->printf("BEST  %lu", (unsigned long)best);
+    cv->setCursor(31, 110); cv->printf("BEST %lu", (unsigned long)best);
   }
   const int16_t bob = (int16_t)(sinf(millis() / 260.0f) * 5.0f);
   blitSprite(PLAYER_X, TOP_MAX - PLR_H + bob, &SPR_RUN_A[0][0], 8, 10, 2);
 }
 
 static void drawOver() {
+  panel(26, 22, 268, 106);
+
   cv->setTextSize(3);
-  cv->setTextColor(C_DARK); cv->setCursor(50, 32); cv->print(F("GAME OVER"));
-  cv->setTextColor(C_MAG);  cv->setCursor(48, 30); cv->print(F("GAME OVER"));
+  cv->setTextColor(C_DARK); cv->setCursor(53, 37); cv->print(F("GAME OVER"));
+  cv->setTextColor(C_MAG);  cv->setCursor(50, 34); cv->print(F("GAME OVER"));
+
   cv->setTextSize(2);
   cv->setTextColor(C_YELLOW);
-  cv->setCursor(66, 68);  cv->printf("SCORE %lu", (unsigned long)score);
-  cv->setCursor(66, 90);  cv->printf("%u M   %u COINS", (unsigned)(distance / 32), coinsGot);
+  cv->setCursor(62, 68);  cv->printf("SCORE %lu", (unsigned long)score);
   cv->setTextSize(1);
+  cv->setCursor(62, 90);  cv->printf("%u M    %u COINS", (unsigned)(distance / 32), coinsGot);
+
   cv->setTextColor(C_WHITE);
   if (millis() - stateSince > 1200 && ((millis() / 400) & 1)) {
-    cv->setCursor(100, 120); cv->print(F("PRESS TO PLAY AGAIN"));
+    cv->setCursor(62, 106); cv->print(F("PRESS TO PLAY AGAIN"));
   }
 }
 
 // HUD and apron live outside the canvas: they change rarely, so drawing them
 // straight to the panel keeps them out of the per-frame SPI budget.
+// The apron is the ground's front face, not another floor: same rock and the
+// same brick hint as the platforms, so the ground reads as solid all the way
+// down instead of looking like a second surface under the first.
 static void drawApron() {
-  gfx->fillRect(0, APRON_Y, SCR_W, SCR_H - APRON_Y, C_BLACK);
-  for (uint8_t k = 0; k < 5; k++)
-    gfx->drawFastHLine(0, APRON_Y + 2 + k * k * 2, SCR_W, C_GRID);
-  for (int8_t i = -5; i <= 5; i++)
-    gfx->drawLine(160 + i * 22, APRON_Y, 160 + i * 96, SCR_H - 1, C_GRID);
+  // Picks up exactly where the play band's ground shading left off and keeps
+  // darkening, so the ground reads as one solid mass down to the bezel.
+  for (int16_t y = APRON_Y; y < SCR_H; y++) {
+    const float t = (float)(y - APRON_Y) / (float)(SCR_H - APRON_Y);
+    gfx->drawFastHLine(0, y, SCR_W, lerpRGB(8, 0, 20, 0, 0, 6, t));
+  }
 }
 
 static void drawHud() {
@@ -842,6 +910,30 @@ static void handleSerial() {
     }
   }
 }
+
+#ifdef GAME_HOST
+// ---------------------------------------------------------------------------
+// Hooks for the macOS harness (host/) only -- never compiled into firmware.
+// They let the desktop build autopilot the runner and grab screenshots, so
+// the look of the game can be reviewed without a board on the desk.
+// ---------------------------------------------------------------------------
+void hostFrameDone();
+
+// What is `dx` pixels in front of the runner: 0 safe, 1 gap, 2 crate, 3 bird.
+int gameProbe(float dx) {
+  const float x = camX + PLAYER_X + dx;
+  for (uint8_t i = 0; i < ncrate; i++)
+    if (x + PLR_W > crates[i].x && x < crates[i].x + CRATE_S) return 2;
+  for (uint8_t i = 0; i < nbird; i++)
+    if (x + PLR_W > birds[i].x && x < birds[i].x + BIRD_W) return 3;
+  return surfaceAt(x, x + PLR_W) == NO_GROUND ? 1 : 0;
+}
+bool     gameGrounded() { return grounded; }
+int      gameState()    { return (int)state; }
+uint8_t  gameLevel()    { return level; }
+uint32_t gameScore()    { return score; }
+const uint16_t *gamePanel();
+#endif
 
 // ---------------------------------------------------------------------------
 // Arduino entry points
@@ -928,6 +1020,10 @@ void loop() {
   render();
   renderUs += micros() - t0;
   drawHud();
+
+#ifdef GAME_HOST
+  hostFrameDone();
+#endif
 
   // Frame timing is the thing worth watching here: the play field is blitted
   // in one SPI transfer, so fps is essentially PLAY_W*PLAY_H*2 / SPI clock.

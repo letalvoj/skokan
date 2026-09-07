@@ -11,3 +11,9 @@
 # Firmware backups (see tools/backup_firmware.sh) -- binaries, not source,
 # so they don't belong in git history, but the dir is kept locally.
 firmware_backups/
+
+# macOS harness: compiled binary and generated frames (regenerate with
+# ./host/shots.sh). Curated stills live in docs/ instead.
+host/skokan
+host/skokan.dSYM/
+host/shots/
