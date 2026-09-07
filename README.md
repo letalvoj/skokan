@@ -138,6 +138,25 @@ them:
   plus a margin. Tunable live over serial (`+`/`-` margin, `[`/`]` span) with
   no reflash needed.
 
+- **A queue whose "busy" flag is written by both ends will lose a wakeup.**
+  The synth's `g_playing` was set by the producer and cleared by the consumer.
+  A note enqueued *during* the 200 ms DMA drain got its flag cleared anyway,
+  so the drain after that note was skipped — and the I2S DMA went back to
+  re-transmitting its last buffer forever (the same failure mode as the
+  original "e e e e" bug, arrived at from a completely different direction).
+  Audible as an endless "cink cink cink" after collecting coins, which stops
+  the moment any other sound is queued, because that queues a real drain.
+  Fixed by only clearing the flag inside the critical section, and only if the
+  queue is still empty at that instant.
+
+- **Generous collision forgiveness will happily rescue you from a hole.** The
+  runner's ground check samples its left *and* right edge and takes the
+  highest surface, so landing on the lip of a platform counts. Combined with
+  dropping the "were you above it last frame?" test, that meant falling into a
+  narrow gap still found ground — the shoulders overlapped the far bank — and
+  the player bobbed back out instead of drowning. Forgiveness has to be
+  bounded: a snap-up is now allowed only from at most 9 px below the surface.
+
 - **The arcade button's LED lamp resistor was found by reading the colour
   bands**: blue-grey-brown-gold = 6, 8, ×10, ±5% = 680 Ω (read right-to-left,
   gold/tolerance last).
@@ -245,22 +264,62 @@ rather than as death.
 ### Rules
 
 - **Coins** (yellow/orange, spinning) — 10 points.
-- **Crates** — jump over them, or land on top; walking into the side costs a life.
-- **Birds** — appear from level 3. Stomp them from above (50 × combo points)
-  or lose a life.
-- **Pits** — fall in and you lose a life, then get dropped back in above the
-  next platform rather than being sent to the title screen.
+- **Crates** — jump over them, or land on top; walking into the side costs a
+  life. They start once the first stretch has been survived (~420 px in).
+- **Birds** — from level 2. Stomp them from above (50 × combo points) or lose
+  a life. About half fly *low* — see below.
+- **Water** — fills every gap. Touching the surface costs a life, always;
+  there are no invulnerability frames on water. You are then dropped back in
+  above the next platform rather than being sent to the title screen.
 - 3 lives. Losing one also drops you back a level, so a bad patch gets
   *easier*, not harder.
 - Best score is saved to flash (NVS, key `best`).
 
+### Designing it for a 4-year-old
+
+The point of a one-button game at this age isn't the score, so the mechanics
+are chosen around what they actually train:
+
+- **Graded control of a binary input.** Tap versus hold is the whole reason
+  jump height is continuous rather than fixed — the same button has to be
+  pressed *differently*, which is a genuinely useful motor skill and the only
+  analogue dimension a single arcade switch has.
+- **Inhibition — not pressing is also a move.** Roughly half the birds fly
+  *low*: they clear a standing runner's head by a few pixels, so they are
+  harmless if you keep running and only ever hit you if you jumped when you
+  didn't need to. Nothing else in the game punishes mashing the button, and
+  without that there is no reason to ever stop pressing it. Low birds are
+  never placed over water, where jumping is compulsory — that would be a trap,
+  not a lesson.
+- **Rhythm and repetition.** From level 2 the generator sometimes emits a
+  **run**: the same gap, at the same spacing, two or three times. Once the
+  first is cleared the next two are the identical movement on a beat, which is
+  how timing gets into the hands. Endless novelty teaches nothing, so runs
+  deliberately override the "no two hard things in a row" rule — a repeated
+  obstacle is *easier* than a random one, not harder.
+- **Consistent consequences.** Water always kills. A rule that only sometimes
+  applies is worse than no rule, which is exactly why the original
+  shallow-gap bug had to go (see [Learnings](#learnings)).
+- **Forgiveness where the failure is motor, not mental.** Coyote time and jump
+  buffering mean a press that is slightly early or slightly late still does
+  what the child *meant*. Small children know what they want to do well before
+  they can time it.
+- **Failure is cheap.** Drowning costs a life but drops you back in and keeps
+  going, and losing a life lowers the speed — so a struggling player naturally
+  settles at their own level instead of hitting a wall.
+
 ### Difficulty ramp
 
-Level 1 runs at **68 px/s** — deliberately slow enough that a small child can
-see a gap coming. Every 900 px of ground is a level, each 11.5 % faster, up
-to a 235 px/s cap. Crates start at level 2, birds at level 3, and the first
-three segments of every run are flat and gapless so there is nothing to fail
-at before you have moved.
+Level 1 runs at **88 px/s** — slow enough that a small child can see a gap
+coming (an obstacle is on screen for ~2.9 s before it arrives), but not a
+crawl. Every 900 px of ground is a level, each 11.5 % faster, up to a 235 px/s
+cap — at which point the warning drops to ~1.1 s, which is the 8-year-old's
+end of the range.
+
+Difficulty ramps in **kinds**, not only speed, introducing one skill at a
+time: gaps first, then crates (~420 px in), then birds and rhythm runs from
+level 2. The first three segments of every run are flat and gapless so there
+is nothing to fail at before you have moved.
 
 ### The "mostly always reachable" terrain generator
 
@@ -281,7 +340,8 @@ AIRTIME = T_UP + T_DOWN                 ~0.63 s  how long you are off the ground
   are capped at 42 % of the full jump height (~27 px), which means they are
   clearable even with a short hop.
 - **Rhythm**: a segment that was hard (big gap or tall step) forces the next
-  one to be flat, gapless and wide — never two hard things in a row.
+  one to be flat, gapless and wide — never two *unrelated* hard things in a
+  row. Deliberate rhythm runs are the exception, and override it.
 - Landing strips are at least `speed × 0.85` wide, so there is always room to
   land, breathe, and take off again at the current speed.
 

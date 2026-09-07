@@ -65,6 +65,22 @@ static bool qPush(uint8_t midi, uint16_t ms, Wave w, uint8_t vol) {
   return ok;
 }
 
+// Clear g_playing ONLY if the queue is still empty at this exact instant.
+// The consumer must not blindly clear a flag the producer may have just set:
+// a note enqueued during the 200 ms drain would otherwise leave g_playing
+// false while it plays, so the drain after it is skipped and the I2S DMA
+// re-transmits that last note forever. That is audible as an endless
+// "cink cink cink" after collecting coins, which stops as soon as any other
+// sound is queued (jumping) because that queues a real drain again.
+static bool qFinishIfStillEmpty() {
+  bool empty;
+  portENTER_CRITICAL(&g_qMux);
+  empty = (g_qHead == g_qTail);
+  if (empty) g_playing = false;
+  portEXIT_CRITICAL(&g_qMux);
+  return empty;
+}
+
 static bool qPop(QNote *out) {
   bool ok = false;
   portENTER_CRITICAL(&g_qMux);
@@ -167,11 +183,14 @@ static void synthTask(void *) {
         g_currentMidi = 0;
         flushSilence(DMA_DRAIN_MS);    // push the last note out, or it loops
         g_ampIdleSince = millis();
-        g_playing      = false;
+        // If something was queued while we were draining, stay "playing" so
+        // the drain after THAT note still happens.
+        qFinishIfStillEmpty();
       }
       vTaskDelay(pdMS_TO_TICKS(4));
       continue;
     }
+    g_playing = true;                  // a note in hand always counts as busy
     ampWakeForPlayback();              // no-op once the amp is already up
     playNote(n.midi, n.ms, (Wave)n.wave, n.vol);
   }

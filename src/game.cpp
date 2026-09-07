@@ -40,6 +40,10 @@ static const int16_t APRON_Y = PLAY_Y + PLAY_H;   // y 198..239  drawn once
 static const int16_t HORIZON = 134;
 static const int16_t SUN_X = 244, SUN_Y = 56, SUN_R = 33;
 static const int16_t TOP_MIN = 106, TOP_MAX = 148;   // platform surface range
+// Water fills every gap, starting just below the lowest platform. Touching it
+// is death -- drawing the danger instead of leaving an empty void is what
+// makes the rule legible to a four-year-old.
+static const int16_t WATER_Y = TOP_MAX + 6;          // 154
 
 // ---------------------------------------------------------------------------
 // Palette -- deliberately tiny, 80s arcade.
@@ -144,7 +148,7 @@ static const float AIRTIME = T_UP + T_DOWN;                                     
 
 // Speed ramp. Deliberately slow at the start -- a 4-year-old has to be able
 // to see the gap coming before it arrives.
-static const float SPEED_0    = 68.0f;     // px/s at level 1
+static const float SPEED_0    = 88.0f;     // px/s at level 1
 static const float SPEED_STEP = 1.115f;    // per level
 static const float SPEED_MAX  = 235.0f;
 static const float LEVEL_DIST = 900.0f;    // px of ground per level
@@ -293,28 +297,52 @@ static void coinArc(float x0, float y0, uint8_t n) {
   }
 }
 
+// A rhythm run: the same obstacle, the same spacing, two or three times over.
+// Repetition is the thing a small child can actually learn from -- once the
+// first one is cleared, the next two are the *same movement* on a beat, which
+// is how timing gets into the hands. Endless novelty teaches nothing.
+static uint8_t runLeft;
+static float   runGap, runRise, runW;
+
 static void addSegment() {
   const Seg &p = segs[nseg - 1];
-  float gap = 0.0f;
+  float   gap = 0.0f, w;
   int16_t top = p.top;
+  float   actualRise = 0.0f;
 
-  if (prevHard) {
-    // Never two hard things in a row: give them a wide flat landing strip.
+  if (runLeft > 0) {
+    // Mid-run: reproduce the previous beat exactly.
+    runLeft--;
+    gap = runGap;
+    top = (int16_t)constrain((float)p.top - runRise, (float)TOP_MIN, (float)TOP_MAX);
+    actualRise = (float)(p.top - top);
+    w   = runW;
+  } else if (prevHard) {
+    // Never two *unrelated* hard things in a row: a wide flat landing strip.
     prevHard = false;
+    w = fmaxf(100.0f, speed * 1.00f) + frnd(0.0f, 70.0f);
   } else {
     const float rise = (random(100) < 45) ? frnd(4.0f, maxRise()) : 0.0f;
     const float drop = (rise == 0.0f && random(100) < 40) ? frnd(6.0f, 40.0f) : 0.0f;
     top = (int16_t)constrain((float)p.top - rise + drop, (float)TOP_MIN, (float)TOP_MAX);
+    actualRise = (float)(p.top - top);
 
-    const float actualRise = (float)(p.top - top);          // >0 means step up
-    if (random(100) < (level < 2 ? 35 : 70))
+    if (random(100) < (level < 2 ? 45 : 72))
       gap = frnd(18.0f, maxGapFor(actualRise));
 
+    w = fmaxf(90.0f, speed * 0.90f) + frnd(0.0f, 90.0f);
     prevHard = (gap > maxGapFor(actualRise) * 0.7f) || (actualRise > maxRise() * 0.7f);
+
+    // Turn this beat into a run. Only from level 2, and never for a step that
+    // also rises -- a repeated flat gap is a rhythm, a repeated staircase is
+    // just a wall.
+    if (level >= 2 && gap > 0.0f && actualRise <= 0.0f && random(100) < 38) {
+      runLeft = (uint8_t)random(2, 4);
+      runGap = gap; runRise = 0.0f; runW = w;
+      prevHard = false;              // the run IS the pattern; do not break it
+    }
   }
 
-  // Wide enough to land, breathe and take off again at the current speed.
-  const float w = fmaxf(90.0f, speed * 0.90f) + frnd(0.0f, 90.0f);
   if (nseg >= MAX_SEG) return;
   segs[nseg++] = { p.x + p.w + gap, w, top };
   const Seg &s = segs[nseg - 1];
@@ -325,8 +353,8 @@ static void addSegment() {
   if (gap > 0.0f) coinArc(p.x + p.w - 26.0f, (float)p.top, 4);
 
   // Crates: something to hop over. Never near an edge, where the player is
-  // busy landing, and never before level 2.
-  if (level >= 2 && s.w > 118.0f && random(100) < 55) {
+  // busy landing, and held back until the first stretch has been survived.
+  if (distance > 420.0f && s.w > 118.0f && random(100) < 55) {
     const float cx = s.x + frnd(48.0f, s.w - 58.0f);
     if (ncrate < MAX_CRATE) {
       crates[ncrate++] = { cx, (int16_t)(s.top - CRATE_S) };
@@ -408,6 +436,7 @@ static void newGame() {
 
   camX = 0; speed = SPEED_0; level = 1; score = 0; scoreAcc = 0; coinsGot = 0;
   lives = START_LIVES; distance = 0; prevHard = false; birdCombo = 0;
+  runLeft = 0;
   invuln = 0; coyote = 0; buffered = 0; usedDouble = false; holding = false;
 
   // Three flat, gapless segments to start on -- nothing to fail at yet, and a
@@ -509,6 +538,7 @@ static void step(float dt) {
   // --- vertical ---
   const float g = (vy < 0.0f) ? (holding ? G_UP_HELD : G_UP_FREE) : G_DOWN;
   vy = fminf(vy + g * dt, VY_MAX);
+  const float prevBottom = py + PLR_H;
   py += vy * dt;
 
   // Support: sample the player's left, middle and right so landing on the
@@ -523,11 +553,14 @@ static void step(float dt) {
 
   const bool wasGrounded = grounded;
   grounded = false;
-  // No prevBottom test on purpose. Platforms are solid columns with no
-  // undersides to jump through, so "feet at or below the surface while
-  // falling" can only mean landing -- or having clipped the side of a step,
-  // which we forgive by snapping up rather than burying the player in rock.
-  if (sup != NO_GROUND && vy >= 0.0f && py + PLR_H >= (float)sup) {
+  // You may only be snapped up onto a surface you were ABOVE last frame (or
+  // barely below, to forgive clipping the lip of a step). Without this test
+  // the wide left/right foot sampling above rescues you from narrow gaps --
+  // your shoulders still overlap the far bank, so falling in "landed" you.
+  // That was the shallow-water bug: small ponds simply did not kill.
+  const float SNAP_TOL = 9.0f;
+  if (sup != NO_GROUND && vy >= 0.0f &&
+      py + PLR_H >= (float)sup && prevBottom <= (float)sup + SNAP_TOL) {
     py = (float)sup - PLR_H;
     if (vy > 260.0f) puff(PLAYER_X + PLR_W / 2, py + PLR_H, C_CYAN, 3);
     vy = 0; grounded = true; usedDouble = false; birdCombo = 0;
@@ -541,18 +574,32 @@ static void step(float dt) {
   }
   if (invuln > 0.0f) invuln -= dt;
 
-  // --- fell down a pit ---
-  if (py > PLAY_H + 10.0f) {
+  // --- hit the water ---
+  // Every platform surface sits above WATER_Y, so feet at the waterline can
+  // only mean there is nothing underneath. No invulnerability frames here:
+  // water always kills, or the rule stops being a rule.
+  if (py + PLR_H >= (float)WATER_Y) {
+    for (uint8_t i = 0; i < 3; i++)
+      puff(PLAYER_X + PLR_W / 2, (float)WATER_Y, C_CYAN, 4);
+    puff(PLAYER_X + PLR_W / 2, (float)WATER_Y, C_WHITE, 4);
+    synthBeep(52, 70, WAVE_TRIANGLE, 90);
+    synthBeep(40, 120, WAVE_TRIANGLE, 90);
     invuln = 0;
-    hurt("pit");
+    hurt("water");
     if (state == ST_OVER) return;
     // Put them back on the next real ground ahead, mid-air, still moving.
+    bool placed = false;
     for (uint8_t i = 0; i < nseg; i++)
       if (segs[i].x > camX + PLAYER_X) {
         camX = segs[i].x - PLAYER_X + 8.0f;
         py   = segs[i].top - PLR_H - 40.0f;
+        placed = true;
         break;
       }
+    // Nothing generated ahead yet: park them safely rather than leaving the
+    // feet under the waterline, which would re-drown them every frame and
+    // burn all three lives in well under a second.
+    if (!placed) py = (float)(TOP_MIN - PLR_H - 20);
     vy = 0;
   }
 
@@ -565,11 +612,21 @@ static void step(float dt) {
   }
 
   // --- birds ---
-  if (level >= 3 && nbird < MAX_BIRD && random(1000) < 7) {
+  // From level 2, and only ever over solid ground: a bird hovering above
+  // water would force a jump into it, which is not a lesson, just a trap.
+  if (level >= 2 && nbird < MAX_BIRD && random(1000) < 9) {
     const float bx = camX + PLAY_W + 20.0f;
     const int16_t s = surfaceAt(bx, bx + BIRD_W);
-    const float base = (s == NO_GROUND) ? (float)TOP_MAX : (float)s;
-    birds[nbird++] = { bx, base - frnd(40.0f, 76.0f), frnd(0, 6.28f), true };
+    if (s != NO_GROUND) {
+      // Two flavours. A LOW bird clears a standing runner's head by a few
+      // pixels but is squarely in the path of a jump -- so it only ever
+      // punishes jumping when you did not need to. That is the whole point:
+      // with one button, deciding NOT to press is the other half of the
+      // skill, and nothing else in the game teaches it.
+      const bool low = random(100) < 55;
+      const float h  = low ? frnd(34.0f, 52.0f) : frnd(60.0f, 82.0f);
+      birds[nbird++] = { bx, (float)s - h, frnd(0, 6.28f), true };
+    }
   }
   for (uint8_t i = 0; i < nbird; i++) {
     Bird &b = birds[i];
@@ -704,10 +761,25 @@ static void drawBackground() {
   for (int8_t i = -4; i <= 12; i++) {
     const float xb = i * 40.0f - vo;
     const float xh = 160.0f + (xb - 160.0f) * 0.25f;   // converge on the centre
-    for (int16_t y = GRID_TOP; y < PLAY_H; y++) {
+    for (int16_t y = GRID_TOP; y < WATER_Y; y++) {
       const float t = (float)(y - GRID_TOP) / (PLAY_H - GRID_TOP);
       cv->drawPixel((int16_t)(xh + (xb - xh) * t), y, C_GRID);
     }
+  }
+
+  // Water. Drawn full width here and then covered by the platforms, so it
+  // shows through exactly where there is a gap -- and nowhere else.
+  for (int16_t y = WATER_Y; y < PLAY_H; y++) {
+    const float t = (float)(y - WATER_Y) / (float)(PLAY_H - WATER_Y);
+    cv->drawFastHLine(0, y, PLAY_W, lerpRGB(0, 60, 130, 0, 10, 48, t));
+  }
+  cv->drawFastHLine(0, WATER_Y, PLAY_W, C_CYAN);          // bright surface line
+  const float ph = millis() / 220.0f;
+  for (int16_t x = 0; x < PLAY_W; x += 2) {               // moving glints
+    const int16_t wy = WATER_Y + 4 + (int16_t)(2.5f * (1.0f + sinf(x * 0.09f + ph)));
+    cv->drawPixel(x, wy, 0x4E5F);
+    const int16_t wy2 = WATER_Y + 13 + (int16_t)(3.0f * (1.0f + sinf(x * 0.06f - ph * 1.3f)));
+    if (wy2 < PLAY_H) cv->drawPixel(x, wy2, 0x2D3F);
   }
 }
 
@@ -926,7 +998,9 @@ int gameProbe(float dx) {
     if (x + PLR_W > crates[i].x && x < crates[i].x + CRATE_S) return 2;
   for (uint8_t i = 0; i < nbird; i++)
     if (x + PLR_W > birds[i].x && x < birds[i].x + BIRD_W) return 3;
-  return surfaceAt(x, x + PLR_W) == NO_GROUND ? 1 : 0;
+  // Narrow window: sampling the runner's full width here would straddle both
+  // banks of a small gap and report solid ground over open water.
+  return surfaceAt(x + PLR_W / 2 - 1, x + PLR_W / 2 + 1) == NO_GROUND ? 1 : 0;
 }
 bool     gameGrounded() { return grounded; }
 int      gameState()    { return (int)state; }
