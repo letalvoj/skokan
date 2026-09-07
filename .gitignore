@@ -1,4 +1,13 @@
+# PlatformIO build output (fully reproducible from source + platformio.ini)
 .pio/
+.pioenvs/
+.piolibdeps/
+
+# Editor / OS cruft
 .vscode/
 *.swp
 .DS_Store
+
+# Firmware backups (see tools/backup_firmware.sh) -- binaries, not source,
+# so they don't belong in git history, but the dir is kept locally.
+firmware_backups/
