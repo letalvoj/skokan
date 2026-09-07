@@ -6,7 +6,7 @@
 #include "display.h"
 #include "pins.h"
 
-static const uint32_t SPI_HZ = 20000000;   // 40 MHz is too much for breadboard jumpers
+static uint32_t SPI_HZ = 20000000;   // 40 MHz is too much for breadboard jumpers
 
 static SPIClass        tftSPI(FSPI);
 static Adafruit_ST7789  st7789(&tftSPI, PIN_TFT_CS, PIN_TFT_DC, PIN_TFT_RST);
@@ -14,7 +14,8 @@ static Adafruit_ILI9341 ili9341(&tftSPI, PIN_TFT_DC, PIN_TFT_CS, PIN_TFT_RST);
 static Preferences      prefs;
 
 DisplayCfg   dcfg = { DRV_ILI9341, 0, false };  // confirmed by eye on this panel
-Adafruit_GFX *gfx = nullptr;
+Adafruit_GFX   *gfx = nullptr;
+Adafruit_SPITFT *tft = nullptr;   // same object, see display.h
 
 int16_t scrW() { return gfx ? gfx->width()  : 240; }
 int16_t scrH() { return gfx ? gfx->height() : 320; }
@@ -39,14 +40,26 @@ void displayApply() {
     // in init(), so our flag toggles it back off when the panel disagrees.
     st7789.invertDisplay(!dcfg.invert);
     gfx = &st7789;
+    tft = &st7789;
   } else {
     ili9341.begin(SPI_HZ);
     ili9341.setRotation(dcfg.rotation);
     ili9341.invertDisplay(dcfg.invert);
     gfx = &ili9341;
+    tft = &ili9341;
   }
-  Serial.printf("[display] panel reports %dx%d\n", gfx->width(), gfx->height());
+  Serial.printf("[display] panel reports %dx%d @ %lu MHz SPI\n",
+                gfx->width(), gfx->height(), (unsigned long)(SPI_HZ / 1000000));
 }
+
+void displaySetSpeed(uint32_t hz) {
+  SPI_HZ = hz;
+  if (tft) tft->setSPISpeed(hz);
+  Serial.printf("[display] SPI clock -> %lu MHz%s\n", (unsigned long)(hz / 1000000),
+                hz > 20000000 ? "  (if the picture tears or flashes, drop back)" : "");
+}
+
+uint32_t displaySpeed() { return SPI_HZ; }
 
 void displaySave() {
   prefs.begin("mluvitko", false);

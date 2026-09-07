@@ -154,6 +154,7 @@ remain useful if something regresses:
 | `step2` | + display, still no mic | display + audio together, no I²S input conflict possible |
 | `step3` | everything — this **is** the current app | the real thing |
 | `mluvitko` (default) | same as `step3` | `pio run -t upload` with no `-e` flag |
+| `game` | **SKOKAN**, the one-button platform game (display + button + speaker, no mic) | `pio run -e game -t upload` |
 
 ### Source layout
 
@@ -161,12 +162,21 @@ remain useful if something regresses:
 - **`src/display.h`/`.cpp`** — owns the SPI bus and the ST7789/ILI9341
   drivers. Runtime-switchable driver/rotation/inversion, persisted to flash.
   Exposes a generic `Adafruit_GFX *gfx` so drawing code doesn't care which
-  controller is live.
+  controller is live — **and** the same object as `Adafruit_SPITFT *tft`,
+  because `drawRGBBitmap()` is not virtual in `Adafruit_GFX`: calling it
+  through `gfx` silently gets the per-pixel base version instead of the bulk
+  SPI one, which is the difference between 20 fps and 0.5 fps. Anything
+  blitting a framebuffer must go through `tft`. `displaySetSpeed()` changes
+  the SPI clock at runtime (see the `f` key).
 - **`src/synth.h`/`.cpp`** — the chiptune voice. Owns I²S output + the amp's
   `SD` (mute) pin, runs on **core 1** in its own FreeRTOS task so a jingle
   plays without blocking the display loop on core 0. Three built-in jingles
   (power-up / ta-daa / ode to joy). Encapsulates every amp-timing and
-  DMA-drain fix above so any future build gets them for free.
+  DMA-drain fix above so any future build gets them for free. Everything it
+  plays goes through a **note queue**, so short game effects can chain (a
+  coin ping lining up behind a jump blip) instead of being dropped the way
+  the old one-jingle-at-a-time request slot did; `synthHoldAmp()` keeps the
+  amp awake through a game so no effect pays the 250 ms wake latency.
 - **`src/mic.h`/`.cpp`** — the microphone + FFT. Owns I²S input. The
   peripheral is fully **stopped** (`i2s_stop`) while not listening, not just
   muted, so its clock lines sit genuinely idle next to the display's SPI.
@@ -175,6 +185,9 @@ remain useful if something regresses:
 - **`src/step3_full.cpp`** — the actual app: face, button handling, layout,
   and the 80s-style segmented spectrum analyser. This is what "mluvitko" is
   right now; read it top to bottom to see the whole behaviour.
+- **`src/game.cpp`** — SKOKAN, the one-button platform game. Self-contained:
+  world generation, physics, sprites and rendering all live here. See
+  [SKOKAN](#skokan-the-game) below.
 - **`src/step1_button_speaker.cpp`**, **`src/step2_display_button_speaker.cpp`**
   — the earlier bring-up stages, kept for regression testing (see table
   above). `step1` additionally has extra diagnostic serial commands
@@ -200,6 +213,109 @@ Press the arcade button:
 5. When idle (not singing, not listening), the face **blinks** at
    irregular intervals so it reads as alive rather than static.
 
+## SKOKAN, the game
+
+`pio run -e game -t upload` — *skokan* is Czech for "jumper". A one-button
+neon platform runner: the screen turns landscape, the runner never stops, and
+the arcade button is the entire control scheme.
+
+### Controls
+
+| Button | Result |
+|---|---|
+| **tap** | short hop (~26 px) |
+| **hold** | full jump (~66 px) — gravity is lower while the button is down, exactly the Mario trick |
+| **press again in mid-air** | **double jump**, once per airtime |
+| **land on a bird while falling** | stomp + bounce; three in one airtime = `TRIPLE!` |
+
+Two forgiveness mechanics are in there deliberately, because a 4-year-old is
+playing: **coyote time** (you can still jump for 90 ms after walking off a
+ledge) and **jump buffering** (a press up to 140 ms too early is remembered
+and fires the moment you land). Landing also samples the runner's left,
+middle *and* right edge, so clipping the lip of a platform counts as landing
+rather than as death.
+
+### Rules
+
+- **Coins** (yellow/orange, spinning) — 10 points.
+- **Crates** — jump over them, or land on top; walking into the side costs a life.
+- **Birds** — appear from level 3. Stomp them from above (50 × combo points)
+  or lose a life.
+- **Pits** — fall in and you lose a life, then get dropped back in above the
+  next platform rather than being sent to the title screen.
+- 3 lives. Losing one also drops you back a level, so a bad patch gets
+  *easier*, not harder.
+- Best score is saved to flash (NVS, key `best`).
+
+### Difficulty ramp
+
+Level 1 runs at **68 px/s** — deliberately slow enough that a small child can
+see a gap coming. Every 900 px of ground is a level, each 11.5 % faster, up
+to a 235 px/s cap. Crates start at level 2, birds at level 3, and the first
+three segments of every run are flat and gapless so there is nothing to fail
+at before you have moved.
+
+### The "mostly always reachable" terrain generator
+
+Terrain is generated a screen and a bit ahead, as a list of segments
+(`{x, width, top}`) with gaps between them. The point is that it can never
+generate something the player cannot clear, and it does that by deriving the
+limits from *the same constants the player physics uses*:
+
+```
+JUMP_H  = JUMP_V0² / (2·G_UP_HELD)      ~66 px   peak of a held jump
+AIRTIME = T_UP + T_DOWN                 ~0.63 s  how long you are off the ground
+```
+
+- **Horizontal**: a jump covers `speed × AIRTIME`. A gap is only ever allowed
+  to be `SAFETY = 0.58` of that, so a mistimed jump still lands.
+- **Vertical**: stepping *up* spends height that would otherwise have been
+  distance, so the gap allowance is scaled by `1 − rise / JUMP_H`. Steps up
+  are capped at 42 % of the full jump height (~27 px), which means they are
+  clearable even with a short hop.
+- **Rhythm**: a segment that was hard (big gap or tall step) forces the next
+  one to be flat, gapless and wide — never two hard things in a row.
+- Landing strips are at least `speed × 0.85` wide, so there is always room to
+  land, breathe, and take off again at the current speed.
+
+Because both terms are recomputed from the live speed, the terrain scales
+itself as the game accelerates instead of needing a hand-written table per
+level.
+
+Coins are placed **along the actual jump parabola** that clears the gap in
+front of them (`coinArc()` integrates the same physics). Collecting the coins
+*is* the correct jump, which is how the timing gets taught without a tutorial.
+
+### Rendering, and why the play field is a band
+
+The play field is composed off-screen into a 320×176 `GFXcanvas16` (in
+internal SRAM, PSRAM as fallback) and pushed in **one bulk SPI transfer**.
+That transfer is the entire frame budget:
+
+```
+320 × 176 × 2 bytes = 112,640 B → ~45 ms at 20 MHz SPI  → ~20 fps
+```
+
+A full 320×240 screen would be ~61 ms before any drawing, which is why the
+HUD (top 22 px) and the grid apron (bottom 42 px) sit *outside* the canvas
+and are redrawn only when they change. Movement is scaled by measured `dt`,
+so the game runs at the same speed whatever frame rate it actually achieves.
+Frame timing is printed to serial every 40 frames.
+
+Press **`f`** to switch the SPI clock to 40 MHz, which roughly doubles the
+frame rate — 20 MHz is the safe breadboard default (see
+[Learnings](#learnings)), so if the picture tears or flashes, press `f` again
+to go back.
+
+### Assets
+
+Deliberately few, authored at 8×10 / 8×5 and drawn at scale 2 so every game
+pixel is a 2×2 block on the panel: runner (two run frames + a jump frame),
+bird (two wing frames), crate and coin (drawn procedurally, the coin's spin
+faked by squashing its width over four frames). The background — gradient
+sky, slitted synthwave sun, parallax mountain silhouette, perspective floor
+grid — is all computed, not stored.
+
 ### Serial commands while running
 
 At 115200 baud, type single characters into the serial monitor:
@@ -214,6 +330,9 @@ At 115200 baud, type single characters into the serial monitor:
 | `+` / `-` | raise/lower the mic's noise-floor margin (how loud before a band lights) |
 | `[` / `]` | shrink/grow the mic's dB span (how much shouting fills the display) |
 
+In the `game` build, `r` flips between the two landscape rotations instead of
+cycling all four, and `f` toggles the SPI clock between 20 and 40 MHz.
+
 `step1` (button+speaker bring-up build) additionally has: `1`/`2`/`3` play a
 specific jingle, `space` replay the last one, `w` cycle waveform
 (sine/triangle/square), `a` keep the amp always-on (diagnostic), `l` disable
@@ -224,6 +343,10 @@ above from the DMA-drain bug.
 ## Where to go next
 
 Ideas discussed but not yet built:
+- SKOKAN: a second character, moving platforms, or a two-player "who gets
+  further" mode. The cheapest big win is dirty-rectangle rendering — the sky
+  above the mountains barely changes, so tracking the topmost moving thing
+  and blitting only from there down would buy back a third of the frame.
 - A note-matching game (sing the target pitch, score by cents off).
 - "Parrot mode": hold the button to record, release to play back
   slowed/sped/reversed.

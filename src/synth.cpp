@@ -37,10 +37,45 @@ const uint8_t SYNTH_JINGLES = 3;
 static const char *NOTE_NAMES[12] =
   {"C","C#","D","D#","E","F","F#","G","G#","A","A#","B"};
 
-static volatile int8_t   g_request      = -1;
 static volatile bool     g_playing      = false;
 static volatile bool     g_ampOn        = false;
+static volatile bool     g_ampHold      = false;
 static volatile uint32_t g_ampIdleSince = 0;
+
+// Everything the synth task plays comes off this queue, jingles included.
+// It exists so short effects can chain (coin ping behind a jump blip) instead
+// of being dropped the way the old "one jingle at a time" request slot did.
+struct QNote { uint8_t midi; uint16_t ms; uint8_t wave; uint8_t vol; };
+static const uint8_t QLEN = 48;
+static QNote           g_q[QLEN];
+static volatile uint8_t g_qHead = 0, g_qTail = 0;
+static portMUX_TYPE     g_qMux  = portMUX_INITIALIZER_UNLOCKED;
+
+static bool qPush(uint8_t midi, uint16_t ms, Wave w, uint8_t vol) {
+  bool ok = false;
+  portENTER_CRITICAL(&g_qMux);
+  const uint8_t next = (uint8_t)((g_qHead + 1) % QLEN);
+  if (next != g_qTail) {
+    g_q[g_qHead] = { midi, ms, (uint8_t)w, vol };
+    g_qHead   = next;
+    g_playing = true;   // set here, not in the task, so synthBusy() is
+    ok        = true;   // truthful the instant the caller enqueues
+  }
+  portEXIT_CRITICAL(&g_qMux);
+  return ok;
+}
+
+static bool qPop(QNote *out) {
+  bool ok = false;
+  portENTER_CRITICAL(&g_qMux);
+  if (g_qTail != g_qHead) {
+    *out   = g_q[g_qTail];
+    g_qTail = (uint8_t)((g_qTail + 1) % QLEN);
+    ok     = true;
+  }
+  portEXIT_CRITICAL(&g_qMux);
+  return ok;
+}
 
 volatile uint8_t g_currentMidi   = 0;
 volatile uint8_t g_currentJingle = 0;
@@ -54,8 +89,8 @@ static inline float midiToHz(uint8_t m) {
   return 440.0f * powf(2.0f, (m - 69) / 12.0f);
 }
 
-static inline float oscillator(float phase) {
-  switch (g_wave) {
+static inline float oscillator(float phase, Wave wave) {
+  switch (wave) {
     case WAVE_SINE:     return sinf(phase * 2.0f * PI);
     case WAVE_TRIANGLE: return 4.0f * fabsf(phase - 0.5f) - 1.0f;
     default:            return phase < 0.5f ? 1.0f : -1.0f;
@@ -87,7 +122,7 @@ static void ampWakeForPlayback() {
   flushSilence(AMP_WAKE_MS);
 }
 
-static void playNote(uint8_t midi, uint16_t ms) {
+static void playNote(uint8_t midi, uint16_t ms, Wave wave, uint8_t vol) {
   const uint32_t total = (uint32_t)((OUT_RATE_HZ * (uint32_t)ms) / 1000);
   const float    step  = midi ? midiToHz(midi) / (float)OUT_RATE_HZ : 0.0f;
 
@@ -102,7 +137,7 @@ static void playNote(uint8_t midi, uint16_t ms) {
     for (uint32_t i = 0; i < n; i++) {
       float s = 0.0f;
       if (midi) {
-        s = oscillator(phase);
+        s = oscillator(phase, wave);
         phase += step;
         if (phase >= 1.0f) phase -= 1.0f;
 
@@ -112,7 +147,7 @@ static void playNote(uint8_t midi, uint16_t ms) {
         const float rel = t > 0.88f ? (1.0f - t) / 0.12f : 1.0f;
         s *= atk * dec * rel;
       }
-      const int16_t v = (int16_t)(s * 5000.0f);
+      const int16_t v = (int16_t)(s * 50.0f * (float)vol);
       buf[i * 2] = v;
       buf[i * 2 + 1] = v;
     }
@@ -123,27 +158,22 @@ static void playNote(uint8_t midi, uint16_t ms) {
 }
 
 static void synthTask(void *) {
+  QNote n;
   for (;;) {
-    if (g_request < 0) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
-
-    const uint8_t idx = (uint8_t)g_request;
-    g_request       = -1;
-    g_playing       = true;
-    g_currentJingle = idx;
-
-    Serial.printf("[synth] \"%s\":", JINGLE_NAMES[idx]);
-    ampWakeForPlayback();
-
-    for (const Note *n = JINGLES[idx]; n->ms; n++) {
-      if (n->midi) Serial.printf(" %s%d", NOTE_NAMES[n->midi % 12], n->midi / 12 - 1);
-      playNote(n->midi, n->ms);
+    if (!qPop(&n)) {
+      // Queue just ran dry: this is the only moment the DMA must be drained,
+      // whether that was the end of a jingle or of a single game blip.
+      if (g_playing) {
+        g_currentMidi = 0;
+        flushSilence(DMA_DRAIN_MS);    // push the last note out, or it loops
+        g_ampIdleSince = millis();
+        g_playing      = false;
+      }
+      vTaskDelay(pdMS_TO_TICKS(4));
+      continue;
     }
-    Serial.println();
-
-    g_currentMidi = 0;
-    flushSilence(DMA_DRAIN_MS);      // push the last note out, or it loops
-    g_ampIdleSince = millis();
-    g_playing = false;
+    ampWakeForPlayback();              // no-op once the amp is already up
+    playNote(n.midi, n.ms, (Wave)n.wave, n.vol);
   }
 }
 
@@ -180,11 +210,34 @@ void synthBegin() {
 }
 
 void synthPlay(uint8_t which) {
-  if (g_playing) return;
-  g_request = (int8_t)(which == 0xFF ? random(SYNTH_JINGLES) : which % SYNTH_JINGLES);
+  if (g_playing) return;             // one jingle at a time, as before
+  const uint8_t idx = (which == 0xFF) ? (uint8_t)random(SYNTH_JINGLES)
+                                      : (uint8_t)(which % SYNTH_JINGLES);
+  g_currentJingle = idx;
+
+  Serial.printf("[synth] \"%s\":", JINGLE_NAMES[idx]);
+  for (const Note *n = JINGLES[idx]; n->ms; n++) {
+    if (n->midi) Serial.printf(" %s%d", NOTE_NAMES[n->midi % 12], n->midi / 12 - 1);
+    qPush(n->midi, n->ms, g_wave, 100);
+  }
+  Serial.println();
+}
+
+void synthBeep(uint8_t midi, uint16_t ms, Wave w, uint8_t vol) {
+  qPush(midi, ms, w, vol);
+}
+
+void synthArp(const uint8_t *midis, uint8_t n, uint16_t msEach, Wave w, uint8_t vol) {
+  for (uint8_t i = 0; i < n; i++) qPush(midis[i], msEach, w, vol);
+}
+
+void synthHoldAmp(bool on) {
+  g_ampHold = on;
+  if (on) g_ampIdleSince = millis();
 }
 
 void synthTick() {
+  if (g_ampHold) { g_ampIdleSince = millis(); return; }
   if (g_ampOn && !g_playing && g_ampIdleSince &&
       millis() - g_ampIdleSince > AMP_IDLE_OFF_MS) {
     ampEnable(false);

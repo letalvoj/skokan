@@ -65,6 +65,20 @@ Press the arcade button. It should light up, play a jingle, and the face
 should change mood. Press again to start "listening" (LED on, spectrum
 analyser appears) — make some noise near the mic.
 
+## 6. Play the game
+
+```bash
+~/.local/bin/pio run -e game -t upload
+```
+
+This flashes **SKOKAN**, the one-button platform runner. Turn the screen
+landscape (or press `r` over serial to flip it the other way up) and press
+the arcade button: tap for a hop, hold for a big jump, press again in mid-air
+for a double jump. Full rules and the terrain generator are in
+[README.md#skokan-the-game](README.md#skokan-the-game).
+
+Go back to the talking box with `~/.local/bin/pio run -t upload`.
+
 If something looks or sounds wrong, check
 [README.md#learnings](README.md#learnings) first — most of the surprising
 behaviour already has a documented cause and fix there.
