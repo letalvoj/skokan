@@ -215,6 +215,10 @@ public:
   }
 };
 static Canvas *cv = nullptr;
+// The HUD gets its own canvas for the same reason the play field has one:
+// drawing it straight to the panel means clearing the bar to black and then
+// putting text back, and at 17 fps that gap is visible as a flickering bar.
+static Canvas *hudCv = nullptr;
 
 static Preferences prefs;
 static uint8_t  g_rot = 1;            // landscape; 'r' flips to the other one
@@ -223,6 +227,7 @@ static uint32_t g_lastHud = 0xFFFFFFFF;
 
 // Precomputed background
 static uint16_t skyLUT[PLAY_H];
+static uint8_t  hudDraws = 0;      // HUD repaints per 40 frames, for the log
 // Ground shading, indexed by absolute y so neighbouring platforms at
 // different heights share one consistent light, and the apron below the play
 // band continues it seamlessly instead of looking like a separate surface.
@@ -930,27 +935,44 @@ static void drawApron() {
   }
 }
 
+static uint32_t g_lastHudMs = 0;
+static uint8_t  g_hudLives = 255, g_hudLevel = 255;
+
 static void drawHud() {
-  const uint32_t key = score * 31u + coinsGot * 7u + lives * 3u + level;
+  const uint32_t key = score * 31u + coinsGot * 7u + lives * 3u + level
+                     + (uint32_t)(distance / 32);
   if (key == g_lastHud) return;
-  g_lastHud = key;
 
-  gfx->fillRect(0, 0, SCR_W, HUD_H, C_BLACK);
-  gfx->drawFastHLine(0, HUD_H - 1, SCR_W, C_MAG);
-  gfx->setTextSize(1);
+  // Lives and level must land the instant they change; the score ticks up
+  // almost every frame and repainting the bar costs real SPI time, so
+  // everything else settles for ~6 Hz, which still reads as live.
+  const bool urgent = (lives != g_hudLives) || (level != g_hudLevel);
+  const uint32_t now = millis();
+  if (!urgent && now - g_lastHudMs < 160) return;
 
-  gfx->setTextColor(C_CYAN);   gfx->setCursor(6, 4);   gfx->print(F("SCORE"));
-  gfx->setTextColor(C_WHITE);  gfx->setCursor(42, 4);  gfx->printf("%06lu", (unsigned long)score);
+  g_lastHud = key; g_lastHudMs = now;
+  g_hudLives = lives; g_hudLevel = level;
+  hudDraws++;
 
-  gfx->fillRect(104, 4, 8, 8, C_YELLOW);
-  gfx->fillRect(106, 6, 4, 4, C_ORANGE);
-  gfx->setTextColor(C_YELLOW); gfx->setCursor(116, 4); gfx->printf("%03u", coinsGot);
+  hudCv->fillScreen(C_BLACK);
+  hudCv->drawFastHLine(0, HUD_H - 1, SCR_W, C_MAG);
+  hudCv->setTextSize(1);
 
-  gfx->setTextColor(C_CYAN);   gfx->setCursor(150, 4); gfx->printf("LV %u", level);
-  gfx->setTextColor(C_WHITE);  gfx->setCursor(196, 4); gfx->printf("%3u M", (unsigned)(distance / 32));
+  hudCv->setTextColor(C_CYAN);  hudCv->setCursor(6, 4);  hudCv->print(F("SCORE"));
+  hudCv->setTextColor(C_WHITE); hudCv->setCursor(42, 4); hudCv->printf("%06lu", (unsigned long)score);
+
+  hudCv->fillRect(104, 4, 8, 8, C_YELLOW);
+  hudCv->fillRect(106, 6, 4, 4, C_ORANGE);
+  hudCv->setTextColor(C_YELLOW); hudCv->setCursor(116, 4); hudCv->printf("%03u", coinsGot);
+
+  hudCv->setTextColor(C_CYAN);  hudCv->setCursor(150, 4); hudCv->printf("LV %u", level);
+  hudCv->setTextColor(C_WHITE); hudCv->setCursor(196, 4); hudCv->printf("%3u M", (unsigned)(distance / 32));
 
   for (uint8_t i = 0; i < START_LIVES; i++)
-    gfx->fillRect(258 + i * 20, 4, 14, 12, i < lives ? C_MAG : 0x2104);
+    hudCv->fillRect(258 + i * 20, 4, 14, 12, i < lives ? C_MAG : 0x2104);
+
+  // One transfer, like the play field. No clear-then-redraw on the panel.
+  tft->drawRGBBitmap(0, 0, hudCv->getBuffer(), SCR_W, HUD_H);
 }
 
 static void render() {
@@ -1032,8 +1054,13 @@ void setup() {
   best = prefs.getUInt("best", 0);
   prefs.end();
 
-  cv = new Canvas(PLAY_W, PLAY_H);
+  cv    = new Canvas(PLAY_W, PLAY_H);
+  hudCv = new Canvas(SCR_W, HUD_H);
   buildBackgroundTables();
+
+  // loop() is pinned to core 1 by the Arduino core, and so is the synth task
+  // -- worth knowing when chasing frame-time jitter.
+  Serial.printf("[game] loop() runs on core %d\n", xPortGetCoreID());
 
   // The title screen wants terrain to stand on, but not a running game.
   nseg = 0;
@@ -1047,7 +1074,7 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t last = 0, fpsT = 0, frames = 0, renderUs = 0;
+  static uint32_t last = 0, fpsT = 0, frames = 0, renderUs = 0, worstUs = 0;
 
   handleSerial();
   synthTick();
@@ -1056,6 +1083,7 @@ void loop() {
     gfx->fillScreen(C_BLACK);
     drawApron();
     g_lastHud = 0xFFFFFFFF;
+    g_hudLives = g_hudLevel = 255;   // force an immediate repaint
     g_needStatic = false;
   }
 
@@ -1092,8 +1120,9 @@ void loop() {
 
   const uint32_t t0 = micros();
   render();
-  renderUs += micros() - t0;
   drawHud();
+  const uint32_t frameUs = micros() - t0;
+  renderUs += frameUs;
 
 #ifdef GAME_HOST
   hostFrameDone();
@@ -1101,11 +1130,16 @@ void loop() {
 
   // Frame timing is the thing worth watching here: the play field is blitted
   // in one SPI transfer, so fps is essentially PLAY_W*PLAY_H*2 / SPI clock.
+  if (frameUs > worstUs) worstUs = frameUs;
   if (fpsT == 0) fpsT = now;
   else if (++frames >= 40 && now > fpsT) {
-    Serial.printf("[game] %.1f fps  (render+blit %lu us)  state=%u speed=%.0f\n",
+    // worst-vs-mean is the number that matters for judder: a steady 17 fps
+    // looks far better than 17 fps average with frames twice as long as the
+    // rest, which is what preemption by the audio task would look like.
+    Serial.printf("[game] %.1f fps  mean %lu us  worst %lu us  hud %u/40  "
+                  "state=%u speed=%.0f\n",
                   frames * 1000.0f / (now - fpsT), (unsigned long)(renderUs / frames),
-                  (unsigned)state, speed);
-    fpsT = now; frames = 0; renderUs = 0;
+                  (unsigned long)worstUs, hudDraws, (unsigned)state, speed);
+    fpsT = now; frames = 0; renderUs = 0; worstUs = 0; hudDraws = 0;
   }
 }

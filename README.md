@@ -149,6 +149,14 @@ them:
   Fixed by only clearing the flag inside the critical section, and only if the
   queue is still empty at that instant.
 
+- **Anything drawn straight to the panel flickers; there are no exceptions.**
+  Everything in the game composes off-screen and blits in one transfer —
+  except the HUD, which cleared its bar to black and then drew text back over
+  it. At 17 fps that intermediate black bar is visible, and only while
+  *playing*, because that is when the score changes and triggers the repaint.
+  It looked like the display "not catching up" under load; it was a missing
+  back buffer on 22 rows of pixels. If a region updates, it needs a canvas.
+
 - **Generous collision forgiveness will happily rescue you from a hole.** The
   runner's ground check samples its left *and* right edge and takes the
   highest surface, so landing on the lip of a platform counts. Combined with
@@ -375,6 +383,18 @@ the blit runs at full wire speed and the remaining 12.3 ms is drawing. A full
 320×240 screen would cost ~61 ms of SPI before any drawing at all, which is
 why the HUD (top 22 px) and the ground apron (bottom 42 px) sit *outside* the
 canvas and are redrawn only when they change.
+
+The HUD gets its **own** small canvas rather than being drawn straight to the
+panel. Direct drawing means clearing the bar to black and then putting the
+text back, and at 17 fps that gap is plainly visible as a flickering bar —
+only while playing, because that is when the score is changing. Its repaints
+are also throttled to ~6 Hz (lives and level still land immediately), since
+the score ticks up nearly every frame and each bar repaint is a real 5.6 ms of
+SPI. Measured frame time is now flat: mean 58.2 ms, worst 58.3 ms.
+
+The one artefact left is **tearing** — the panel has no TE line broken out, so
+a blit that takes 45 ms is necessarily shown partway through. `f` (40 MHz)
+halves the window and is the only lever there is.
 
 Movement is scaled by measured `dt`, so the game runs at the same speed
 whatever frame rate it achieves — the clock change makes it smoother, not
