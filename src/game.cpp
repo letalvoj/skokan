@@ -154,7 +154,9 @@ static const float SPEED_MAX  = 235.0f;
 static const float LEVEL_DIST = 900.0f;    // px of ground per level
 
 static const uint8_t START_LIVES = 3;
-static const uint16_t COIN_POINTS = 25;   // vs ~0.12 x speed points/s of distance
+static const uint16_t COIN_POINTS  = 25;   // vs ~0.12 x speed points/s of distance
+static const uint16_t GEM_POINTS   = 150;
+static const uint8_t  MAX_LIVES    = 5;
 
 // ---------------------------------------------------------------------------
 // Pacing: the escape window.
@@ -190,13 +192,16 @@ static const uint8_t LV_BIRDS_ALL = 4;
 // World
 // ---------------------------------------------------------------------------
 struct Seg   { float x, w; int16_t top; };
-struct Coin  { float x, y; bool alive; };
+// One struct for everything you can pick up, so culling, collision and
+// drawing stay in one place. GEM is a rare 4x coin; HEART gives a life back.
+enum PickKind : uint8_t { PK_COIN = 0, PK_GEM, PK_HEART };
+struct Coin  { float x, y; bool alive; uint8_t kind; };
 struct Crate { float x; int16_t top; };
-struct Bird  { float x, y, phase; bool alive; };
-struct Part  { float x, y, vx, vy; uint8_t life; uint16_t col; };
+struct Bird  { float x, y, phase; bool alive, scored; };
+struct Part  { float x, y, vx, vy; uint8_t life, size; uint16_t col; };
 
 static const uint8_t MAX_SEG = 14, MAX_COIN = 64, MAX_CRATE = 16;
-static const uint8_t MAX_BIRD = 6, MAX_PART = 28;
+static const uint8_t MAX_BIRD = 6, MAX_PART = 52;   // room for a proper explosion
 
 static Seg   segs[MAX_SEG];    static uint8_t nseg;
 static Coin  coins[MAX_COIN];  static uint8_t ncoin;
@@ -376,7 +381,12 @@ static float maxRise() { return JUMP_H * 0.42f; }   // ~27 px
 static void addCoin(float x, float y) {
   if (ncoin >= MAX_COIN) return;
   STAT(statCoinSpawn);
-  coins[ncoin++] = { x, y, true };
+  coins[ncoin++] = { x, y, true, PK_COIN };
+}
+
+static void addPickup(float x, float y, uint8_t kind) {
+  if (ncoin >= MAX_COIN) return;
+  coins[ncoin++] = { x, y, true, kind };
 }
 
 // Lay coins along the actual jump parabola out of (x0, y0). Collecting them
@@ -427,7 +437,7 @@ static void placeHazard(const Seg &s) {
     // bob amplitude, or the bob alone could clip a standing player.
     const bool low = (level < LV_BIRDS_ALL) || (random(100) < 55);
     const float h  = low ? frnd(38.0f, 54.0f) : frnd(62.0f, 84.0f);
-    birds[nbird++] = { x, (float)s.top - h, frnd(0, 6.28f), true };
+    birds[nbird++] = { x, (float)s.top - h, frnd(0, 6.28f), true, false };
     nextHazardX = x + BIRD_W + sep;
   } else if (ncrate < MAX_CRATE) {
     crates[ncrate++] = { x, (int16_t)(s.top - CRATE_S) };
@@ -489,12 +499,25 @@ static void addSegment() {
 
   placeHazard(s);
 
-  // Somewhere quiet, a low row of coins: a free hop, and a hint that up is
-  // good. Purely a reward, so it needs no separation of its own.
-  if (random(100) < 40) {
-    const float cx = s.x + frnd(40.0f, fmaxf(45.0f, s.w - 60.0f));
+  // A reward says "jump here". It must never say that where a bird is
+  // waiting -- a low bird sits from top-54 to top-28 and a coin row sits at
+  // top-34, so without this check the two can overlap exactly and the coins
+  // become bait.
+  const float rx = s.x + frnd(40.0f, fmaxf(45.0f, s.w - 60.0f));
+  bool clear = true;
+  for (uint8_t i = 0; i < nbird; i++)
+    if (birds[i].x + BIRD_W > rx - 52.0f && birds[i].x < rx + 106.0f) clear = false;
+  if (!clear) return;
+
+  // Rare treasure, in rising order of rarity. A heart is the only way to get
+  // a life back, so it stays genuinely uncommon.
+  if (level >= LV_BIRDS_ALL && random(1000) < 6) {
+    addPickup(rx, (float)s.top - 42.0f, PK_HEART);
+  } else if (level >= LV_CRATES && random(100) < 9) {
+    addPickup(rx, (float)s.top - 40.0f, PK_GEM);
+  } else if (random(100) < 40) {
     for (uint8_t i = 0; i < 3; i++)
-      addCoin(cx + i * 18.0f, (float)s.top - 34.0f);
+      addCoin(rx + i * 18.0f, (float)s.top - 34.0f);
   }
 }
 
@@ -586,9 +609,47 @@ static void sfxOver()   { const uint8_t a[] = {69, 65, 62, 57, 50}; synthArp(a, 
 static void puff(float x, float y, uint16_t col, uint8_t n) {
   for (uint8_t i = 0, made = 0; i < MAX_PART && made < n; i++)
     if (parts[i].life == 0) {
-      parts[i] = { x, y, frnd(-70, 70), frnd(-110, -20), (uint8_t)random(7, 13), col };
+      parts[i] = { x, y, frnd(-70, 70), frnd(-110, -20),
+                   (uint8_t)random(7, 13), 3, col };
       made++;
     }
+}
+
+// A proper explosion: particles thrown in every direction at real speed, in
+// mixed sizes and colours, rather than the polite little upward puff.
+static void burst(float x, float y, uint8_t n, uint16_t a, uint16_t b) {
+  for (uint8_t i = 0, made = 0; i < MAX_PART && made < n; i++)
+    if (parts[i].life == 0) {
+      const float ang = frnd(0.0f, 6.2832f), sp = frnd(60.0f, 260.0f);
+      parts[i] = { x, y, cosf(ang) * sp, sinf(ang) * sp - 40.0f,
+                   (uint8_t)random(10, 22), (uint8_t)random(2, 6),
+                   (made & 1) ? a : b };
+      made++;
+    }
+}
+
+// Screen shake and a flash frame, both decaying in seconds.
+static float shakeT = 0.0f, flashT = 0.0f;
+static void kick(float shake, float flash) {
+  if (shake > shakeT) shakeT = shake;
+  if (flash > flashT) flashT = flash;
+}
+
+// Hitstop: the whole world holds still for a few dozen milliseconds on a big
+// hit. It is the cheapest trick in game feel and by far the most effective --
+// the pause is what makes an impact land instead of just happening.
+static float freezeT = 0.0f;
+
+// An expanding shockwave ring, and a score number that floats off the hit.
+static float ringT = 0.0f, ringX = 0.0f, ringY = 0.0f;
+static float popT  = 0.0f, popX  = 0.0f, popY  = 0.0f;
+static char  popText[12];
+
+static void celebrate(float x, float y, float power, int points) {
+  ringT = 0.30f; ringX = x; ringY = y;
+  popT  = 0.85f; popX  = x; popY  = y - 24.0f;   // clear of the debris
+  snprintf(popText, sizeof(popText), "+%d", points);
+  freezeT = 0.05f + power * 0.03f;
 }
 
 // ---------------------------------------------------------------------------
@@ -605,6 +666,7 @@ static void newGame() {
   camX = 0; speed = SPEED_0; level = 1; score = 0; scoreAcc = 0; coinsGot = 0;
   lives = START_LIVES; distance = 0; birdCombo = 0;
   runLeft = 0; nextHazardX = -1e9f;
+  shakeT = flashT = freezeT = ringT = popT = 0.0f;
   attract = botDrive = false;   // a real game; startAttract re-arms them
   egg.active = false; scheduleEgg();
   invuln = 0; coyote = 0; buffered = 0; usedDouble = false; holding = false;
@@ -1006,6 +1068,19 @@ static void step(float dt) {
     Bird &b = birds[i];
     b.phase += 6.0f * dt;
     const float by = b.y + sinf(b.phase) * 5.0f;
+
+    // Ran underneath it without jumping. That is exactly the skill the low
+    // birds exist to teach, so it pays -- otherwise the only feedback for
+    // playing correctly is the absence of punishment, which teaches nothing.
+    if (b.alive && !b.scored && grounded && b.x + BIRD_W < wx + PLR_W * 0.5f &&
+        by + BIRD_H > py - 26.0f) {
+      b.scored = true;
+      score += 30;
+      snprintf(banner, sizeof(banner), "COOL!");
+      bannerUntil = millis() + 700;
+      puff(PLAYER_X + PLR_W / 2, py - 6.0f, C_CYAN, 4);
+      synthBeep(88, 40, WAVE_SQUARE, 55);
+    }
     if (wx + PLR_W - 3 > b.x && wx + 3 < b.x + BIRD_W &&
         py + PLR_H > by && py < by + BIRD_H) {
       if (vy > 40.0f && py + PLR_H < by + BIRD_H * 0.8f) {
@@ -1013,12 +1088,21 @@ static void step(float dt) {
         vy = STOMP_V0; usedDouble = false;
         birdCombo++;
         score += 50 * birdCombo;
-        puff(b.x - camX + BIRD_W / 2, by, C_MAG, 8);   // particles live in screen space
+
+        // Feathers everywhere, a flash, and a thump you can feel. Particles
+        // live in screen space, hence the -camX.
+        const float bx = b.x - camX + BIRD_W / 2;
+        burst(bx, by, 18 + birdCombo * 6, C_WHITE, C_MAG);
+        burst(bx, by, 8, C_CYAN, C_YELLOW);
+        kick(0.16f + birdCombo * 0.05f, 0.07f);
         sfxStomp();
-        if (birdCombo >= 3) {
-          snprintf(banner, sizeof(banner), "TRIPLE!");
-          bannerUntil = millis() + 1100;
-        }
+
+        celebrate(bx, by, (float)birdCombo, 50 * birdCombo);
+
+        static const char *COMBO[] = { "SPLAT!", "DOUBLE!", "TRIPLE!", "INSANE!!" };
+        snprintf(banner, sizeof(banner), "%s",
+                 COMBO[birdCombo > 4 ? 3 : birdCombo - 1]);
+        bannerUntil = millis() + 900 + birdCombo * 120;
       } else hurt("bird");
     }
   }
@@ -1031,11 +1115,37 @@ static void step(float dt) {
         py + PLR_H > c.y && py < c.y + COIN_S) {
       // Worth enough that collecting is a real strategy, not a rounding error
       // next to distance points.
-      c.alive = false; coinsGot++; score += COIN_POINTS; STAT(statCoins);
-      puff(c.x - camX + COIN_S / 2, c.y + COIN_S / 2, C_YELLOW, 4);
-      sfxCoin();
+      c.alive = false;
+      const float px = c.x - camX + COIN_S / 2, pyv = c.y + COIN_S / 2;
+      if (c.kind == PK_GEM) {
+        score += GEM_POINTS;
+        burst(px, pyv, 16, C_CYAN, C_WHITE);
+        kick(0.10f, 0.05f);
+        snprintf(banner, sizeof(banner), "GEM!");
+        bannerUntil = millis() + 900;
+        const uint8_t a[] = { 84, 88, 91, 96 };
+        synthArp(a, 4, 45, WAVE_SQUARE, 75);
+      } else if (c.kind == PK_HEART) {
+        if (lives < MAX_LIVES) lives++;
+        g_lastHud = 0xFFFFFFFF;
+        burst(px, pyv, 20, C_MAG, C_WHITE);
+        kick(0.14f, 0.08f);
+        snprintf(banner, sizeof(banner), "1 UP!");
+        bannerUntil = millis() + 1300;
+        const uint8_t a[] = { 72, 79, 84, 88, 91 };
+        synthArp(a, 5, 60, WAVE_SQUARE, 85);
+      } else {
+        coinsGot++; score += COIN_POINTS; STAT(statCoins);
+        puff(px, pyv, C_YELLOW, 4);
+        sfxCoin();
+      }
     }
   }
+
+  shakeT = fmaxf(0.0f, shakeT - dt);
+  flashT = fmaxf(0.0f, flashT - dt);
+  ringT  = fmaxf(0.0f, ringT  - dt);
+  if (popT > 0.0f) { popT -= dt; popY -= 34.0f * dt; }
 
   // --- particles ---
   for (uint8_t i = 0; i < MAX_PART; i++) {
@@ -1214,6 +1324,10 @@ static void drawBackground() {
 }
 
 static void drawWorld() {
+  // Shake displaces the WORLD only -- the sky and sun stay put, which reads as
+  // the ground being hit rather than the camera being broken.
+  const float camX = ::camX + (shakeT > 0.0f
+      ? sinf(millis() * 0.09f) * (shakeT * 26.0f) : 0.0f);
   // Platforms
   for (uint8_t i = 0; i < nseg; i++) {
     const int16_t x = (int16_t)(segs[i].x - camX);
@@ -1260,6 +1374,27 @@ static void drawWorld() {
     if (x > PLAY_W || x + COIN_S < 0) continue;
     // Phase from the coin's own world position, so a row of them does not
     // spin in lockstep (which reads as a row of identical bars, not coins).
+    if (coins[i].kind == PK_GEM) {
+      // A diamond, so it never reads as a big coin.
+      const uint8_t p = (millis() / 110) & 3;
+      const int16_t h = COIN_S + 2, cxm = x + COIN_S / 2;
+      for (int16_t r = 0; r < h; r++) {
+        const int16_t half = (r < h / 2) ? (r + 1) : (h - r);
+        cv->drawFastHLine(cxm - half, y + r, half * 2, (r < h / 2) ? C_CYAN : 0x03BF);
+      }
+      cv->fillRect(cxm - 1 + (p == 1 ? 1 : 0), y + 3, 2, 3, C_WHITE);
+      continue;
+    }
+    if (coins[i].kind == PK_HEART) {
+      const int16_t b = ((millis() / 140) & 1) ? 1 : 0;   // gentle pulse
+      cv->fillRect(x + 1 - b, y + 2 - b, 4 + b * 2, 5 + b, C_MAG);
+      cv->fillRect(x + 7 - b, y + 2 - b, 4 + b * 2, 5 + b, C_MAG);
+      cv->fillRect(x + 1 - b, y + 5, 10 + b * 2, 3, C_MAG);
+      cv->fillRect(x + 3, y + 8, 6, 2, C_MAG);
+      cv->fillRect(x + 5, y + 10, 2, 2, C_MAG);
+      cv->fillRect(x + 2, y + 3, 2, 2, C_WHITE);
+      continue;
+    }
     const uint8_t f  = (uint8_t)((millis() / 90 + (uint32_t)(coins[i].x * 0.09f)) & 3);
     const int16_t w  = cw[f], cx = x + (COIN_S - w) / 2;
     cv->fillRoundRect(cx, y, w, COIN_S, 3, C_YELLOW);
@@ -1279,7 +1414,8 @@ static void drawWorld() {
   // Particles
   for (uint8_t i = 0; i < MAX_PART; i++)
     if (parts[i].life)
-      cv->fillRect((int16_t)parts[i].x, (int16_t)parts[i].y, 3, 3, parts[i].col);
+      cv->fillRect((int16_t)parts[i].x, (int16_t)parts[i].y,
+                   parts[i].size, parts[i].size, parts[i].col);
 
   // Player -- blink while invincible so the hit reads clearly. The title and
   // game-over screens pose their own runner, so skip ours there.
@@ -1288,6 +1424,40 @@ static void drawWorld() {
                                                           : &SPR_RUN_B[0][0])
                                   : &SPR_JUMP[0][0];
     blitSprite(PLAYER_X, (int16_t)py, spr, 8, 10, 2);
+  }
+
+  // Shockwave: a ring thrown out from the hit, thinning as it grows.
+  if (ringT > 0.0f) {
+    const float k = 1.0f - ringT / 0.30f;
+    const int16_t r = (int16_t)(6.0f + k * 46.0f);
+    const uint16_t c = (k < 0.4f) ? C_WHITE : (k < 0.7f ? C_MAG : 0x7810);
+    cv->drawCircle((int16_t)ringX, (int16_t)ringY, r, c);
+    if (k < 0.6f) cv->drawCircle((int16_t)ringX, (int16_t)ringY, r - 2, c);
+  }
+
+  // The points, floating off the kill.
+  if (popT > 0.0f && popText[0]) {
+    cv->setTextSize(2);
+    const int16_t px = (int16_t)popX - (int16_t)(strlen(popText) * 6);
+    cv->setTextColor(C_DARK);   cv->setCursor(px + 1, (int16_t)popY + 1); cv->print(popText);
+    cv->setTextColor(popT > 0.4f ? C_WHITE : C_YELLOW);
+    cv->setCursor(px, (int16_t)popY); cv->print(popText);
+  }
+
+  // Flash, confined to the blast. A full-screen strobe on every stomp is both
+  // overwhelming and a real photosensitivity risk in a game aimed at small
+  // children -- and localising it reads better anyway, because it points at
+  // what just happened instead of washing the whole scene out.
+  if (flashT > 0.0f) {
+    const int16_t step = (flashT > 0.035f) ? 3 : 5;
+    const float   reach = 52.0f;
+    const int16_t y0 = max(0, (int)(ringY - reach));
+    const int16_t y1 = min((int)PLAY_H, (int)(ringY + reach));
+    for (int16_t y = y0; y < y1; y += step) {
+      const float d = fabsf((float)y - ringY) / reach;
+      const int16_t half = (int16_t)((1.0f - d) * 104.0f);
+      if (half > 2) cv->drawFastHLine((int16_t)ringX - half, y, half * 2, 0x9CDF);
+    }
   }
 
   // Banner
@@ -1325,6 +1495,11 @@ static void drawTitle() {
   }
   const int16_t bob = (int16_t)(sinf(millis() / 260.0f) * 5.0f);
   blitSprite(PLAYER_X, TOP_MAX - PLR_H + bob, &SPR_RUN_A[0][0], 8, 10, 2);
+
+  cv->setTextSize(1);
+  cv->setTextColor(0x6B5D);
+  cv->setCursor(6, PLAY_H - 10);
+  cv->print(F("(C) 2026 VOJTECH LETAL"));
 }
 
 // The attract overlay. Deliberately much lighter than the title card: the
@@ -1363,6 +1538,11 @@ static void drawOver() {
   if (millis() - stateSince > 1200 && ((millis() / 400) & 1)) {
     cv->setCursor(62, 106); cv->print(F("PRESS TO PLAY AGAIN"));
   }
+
+  cv->setTextSize(1);
+  cv->setTextColor(0x6B5D);
+  cv->setCursor(6, PLAY_H - 10);
+  cv->print(F("SKOKAN  (C) 2026 VOJTECH LETAL"));
 }
 
 // HUD and apron live outside the canvas: they change rarely, so drawing them
@@ -1533,6 +1713,9 @@ float    gameDistance()         { return distance; }
 void     gameStartNow()         { newGame(); }
 
 int      gameEggKind()  { return egg.active ? (int)egg.kind : -1; }
+// True in the frames right after a bird stomp, so the harness can photograph
+// the explosion instead of guessing a frame number.
+bool     gameStomping() { return ringT > 0.10f; }
 bool     gameEggOnScreen() { return egg.active && egg.x > 60.0f && egg.x < PLAY_W - 60.0f; }
 bool     gameGrounded() { return grounded; }
 int      gameState()    { return (int)state; }
@@ -1617,6 +1800,7 @@ void loop() {
       if (botDrive) { botThink(dt); holding = botHolding; }
       else if (pressed) tryJump();
       if (attract && pressed) { newGame(); sfxLevel(); }   // a child took over
+      else if (freezeT > 0.0f) freezeT -= dt;              // hitstop
       else step(dt);
       break;
     case ST_OVER:

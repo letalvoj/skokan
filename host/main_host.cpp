@@ -18,6 +18,7 @@ int      gameProbe(float dx);
 int      gameCheckWorld();
 int      gameEggKind();
 bool     gameEggOnScreen();
+bool     gameStomping();
 bool     gameGrounded();
 int      gameState();
 uint8_t  gameLevel();
@@ -94,6 +95,9 @@ void hostFrameDone() {
   static uint8_t lastLevel = 1;
   if (!gotLevel && gameLevel() == 3 && lastLevel == 2) { capture("08-levelup"); gotLevel = true; }
   lastLevel = gameLevel();
+
+  static bool gotStomp = false;
+  if (!gotStomp && gameStomping()) { capture("13-stomp"); gotStomp = true; }
 
   // Catch one of each sky easter egg, mid-flight and well inside the frame.
   static bool gotEgg[4] = { false, false, false, false };
