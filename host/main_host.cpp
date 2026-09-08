@@ -15,6 +15,9 @@ void setup();
 void loop();
 
 int      gameProbe(float dx);
+int      gameCheckWorld();
+int      gameEggKind();
+bool     gameEggOnScreen();
 bool     gameGrounded();
 int      gameState();
 uint8_t  gameLevel();
@@ -90,6 +93,15 @@ void hostFrameDone() {
   static uint8_t lastLevel = 1;
   if (!gotLevel && gameLevel() == 3 && lastLevel == 2) { capture("08-levelup"); gotLevel = true; }
   lastLevel = gameLevel();
+
+  // Catch one of each sky easter egg, mid-flight and well inside the frame.
+  static bool gotEgg[4] = { false, false, false, false };
+  static const char *eggName[4] = { "09-egg-plane", "09-egg-satellite",
+                                    "09-egg-ufo", "09-egg-star" };
+  const int ek = gameEggKind();
+  if (ek >= 0 && ek < 4 && !gotEgg[ek] && gameEggOnScreen()) {
+    capture(eggName[ek]); gotEgg[ek] = true;
+  }
 }
 
 int main(int argc, char **argv) {
@@ -109,13 +121,25 @@ int main(int argc, char **argv) {
   srand(seed);
   setup();
 
+  uint32_t badFrames = 0, worstBad = 0;
   for (frameNo = 0; frameNo < total; frameNo++) {
     autopilot();
     loop();
+    // The fairness contract, checked on every single generated world state.
+    const int bad = gameCheckWorld();
+    if (bad > 0) {
+      if (badFrames == 0)
+        printf("[CHECK] FIRST VIOLATION at frame %u (level %u): %d\n",
+               frameNo, gameLevel(), bad);
+      badFrames++;
+      if ((uint32_t)bad > worstBad) worstBad = bad;
+    }
     hostMillis += FRAME_MS;
   }
 
   printf("[host] %u frames simulated (%.1f s of play), %u shots written\n",
          total, total * FRAME_MS / 1000.0, shotCount);
-  return 0;
+  printf("[CHECK] unclearable configurations: %u frames of %u (worst %u)  --> %s\n",
+         badFrames, total, worstBad, badFrames ? "FAIL" : "PASS");
+  return badFrames ? 1 : 0;
 }

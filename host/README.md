@@ -35,9 +35,21 @@ so a change can be *seen* rather than guessed at.
   button when something is coming. It plays about as well as a distracted
   adult, which is roughly the point — it exercises gaps, crates and birds.
 
+- It also **checks the fairness contract on every frame**. `gameCheckWorld()`
+  counts genuinely unclearable configurations — anything forcing a jump with a
+  bird inside the arc that jump must travel, and birds over water — and the
+  run exits non-zero if any are found, so it works as a regression test:
+
+  ```bash
+  ./host/skokan 12000 42 | grep CHECK
+  ```
+
+  It has been negative-tested: reinstating the old drifting birds makes it
+  fail at frame 540. A check that has never failed proves nothing.
+
 Captures are written when a listed frame comes up, plus automatically the
-first time the game reaches the game-over screen and the first level-up
-banner. `sips` converts them to PNG; the 320x240 frame is scaled 3x with
+first time the game reaches the game-over screen, the first level-up banner,
+and one of each of the four sky easter eggs mid-flight. `sips` converts them to PNG; the 320x240 frame is scaled 3x with
 nearest-neighbour so the 2x2 pixel art stays crisp.
 
 ## What it is not

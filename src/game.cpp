@@ -156,6 +156,30 @@ static const float LEVEL_DIST = 900.0f;    // px of ground per level
 static const uint8_t START_LIVES = 3;
 
 // ---------------------------------------------------------------------------
+// Pacing: the escape window.
+//
+// The one rule that makes the world fair is that hazards are SEPARATED. Every
+// hazard -- a gap, a crate, a bird -- reserves clear flat ground after it
+// before the next one may start, and that window is measured in SECONDS of
+// reaction time rather than pixels: at 235 px/s the same pixel gap gives less
+// than half the thinking time it does at 88, so pixels are the wrong unit for
+// difficulty. Narrowing this window is the single knob that makes the game
+// harder, and it narrows every level.
+//
+// SEP_T_MIN is load-bearing, not taste: it is comfortably longer than
+// AIRTIME (0.63 s), which is what guarantees a jump can never carry you into
+// the next hazard, at any speed. Do not drop it below AIRTIME.
+static const float SEP_T0     = 1.80f;   // seconds of clear ground at level 1
+static const float SEP_T_STEP = 0.11f;   // shaved off per level
+static const float SEP_T_MIN  = 0.95f;   // floor -- see above
+
+// Which hazards exist yet. One new skill at a time, so a four-year-old is
+// never learning two things at once.
+static const uint8_t LV_CRATES    = 2;
+static const uint8_t LV_BIRDS_LOW = 3;
+static const uint8_t LV_BIRDS_ALL = 4;
+
+// ---------------------------------------------------------------------------
 // World
 // ---------------------------------------------------------------------------
 struct Seg   { float x, w; int16_t top; };
@@ -181,13 +205,25 @@ static uint16_t coinsGot;
 static uint8_t  lives;
 static float    distance;          // px run this game
 static float    scoreAcc;          // sub-point remainder of the distance score
-static bool     prevHard;          // last segment was a hard one
+// World x from which the next hazard may START. Every hazard placement reads
+// it and pushes it forward, which is what keeps gaps, crates and birds from
+// ever landing on top of each other -- there is exactly one authority.
+static float    nextHazardX;
 
 // Player
 static float   py, vy;             // band-local y of the sprite top
 static bool    grounded, usedDouble, holding;
 static float   coyote, buffered, invuln;
 static uint8_t birdCombo;
+
+// ---- sky easter eggs ------------------------------------------------------
+// About one per level, drifting across the upper sky. Purely decorative and
+// never near the ground: the reward is spotting one, so they are deliberately
+// quiet -- no sound, no banner, and only one at a time.
+enum EggKind : uint8_t { EGG_PLANE = 0, EGG_SAT, EGG_UFO, EGG_STAR, EGG_KINDS };
+struct SkyEgg { uint8_t kind; float x, y, vx, phase; bool active; };
+static SkyEgg  egg;
+static float   eggNextDist;      // spawn the next one when distance passes this
 
 enum State : uint8_t { ST_TITLE, ST_PLAY, ST_OVER };
 static State state = ST_TITLE;
@@ -307,70 +343,139 @@ static void coinArc(float x0, float y0, uint8_t n) {
 // first one is cleared, the next two are the *same movement* on a beat, which
 // is how timing gets into the hands. Endless novelty teaches nothing.
 static uint8_t runLeft;
-static float   runGap, runRise, runW;
+static float   runGap, runW;
+
+// The escape window in pixels, at the current speed and level.
+static float hazardSep() {
+  const float t = constrain(SEP_T0 - (level - 1) * SEP_T_STEP, SEP_T_MIN, SEP_T0);
+  return speed * t;
+}
+
+// Place at most one crate or bird on this segment, and only in the part of it
+// that is already clear of every other hazard. Everything goes through
+// nextHazardX, which is why a bird can no longer end up sitting over a crate:
+// the crate pushed the window past the bird's only legal position.
+static void placeHazard(const Seg &s) {
+  if (level < LV_CRATES) return;                 // level 1 is gaps only
+  const float sep = hazardSep();
+  const float lo  = fmaxf(s.x + 46.0f, nextHazardX);
+  const float hi  = s.x + s.w - 54.0f;
+  if (lo > hi) return;                           // no legal room on this one
+  if (random(100) > 62) return;                  // not every segment gets one
+
+  const float x = frnd(lo, hi);
+  const bool  wantBird = (level >= LV_BIRDS_LOW) && (random(100) < 48);
+
+  if (wantBird && nbird < MAX_BIRD) {
+    // LOW birds clear a standing runner's head by a few pixels, so they are
+    // harmless if you keep running and only ever punish a jump you did not
+    // need -- the inhibition lesson. The height accounts for the vertical
+    // bob amplitude, or the bob alone could clip a standing player.
+    const bool low = (level < LV_BIRDS_ALL) || (random(100) < 55);
+    const float h  = low ? frnd(38.0f, 54.0f) : frnd(62.0f, 84.0f);
+    birds[nbird++] = { x, (float)s.top - h, frnd(0, 6.28f), true };
+    nextHazardX = x + BIRD_W + sep;
+  } else if (ncrate < MAX_CRATE) {
+    crates[ncrate++] = { x, (int16_t)(s.top - CRATE_S) };
+    coinArc(x - 34.0f, (float)s.top, 3);
+    nextHazardX = x + CRATE_S + sep;
+  }
+}
 
 static void addSegment() {
   const Seg &p = segs[nseg - 1];
+  const float sep     = hazardSep();
+  const float prevEnd = p.x + p.w;      // where a gap here would begin
   float   gap = 0.0f, w;
   int16_t top = p.top;
   float   actualRise = 0.0f;
 
-  if (runLeft > 0) {
-    // Mid-run: reproduce the previous beat exactly.
-    runLeft--;
+  // A gap is a hazard like any other: it may only open once the previous
+  // hazard's escape window has been paid out.
+  const bool gapAllowed = (prevEnd >= nextHazardX);
+
+  if (runLeft > 0 && gapAllowed) {
+    runLeft--;                          // mid-run: reproduce the beat exactly
     gap = runGap;
-    top = (int16_t)constrain((float)p.top - runRise, (float)TOP_MIN, (float)TOP_MAX);
-    actualRise = (float)(p.top - top);
     w   = runW;
-  } else if (prevHard) {
-    // Never two *unrelated* hard things in a row: a wide flat landing strip.
-    prevHard = false;
-    w = fmaxf(100.0f, speed * 1.00f) + frnd(0.0f, 70.0f);
   } else {
-    const float rise = (random(100) < 45) ? frnd(4.0f, maxRise()) : 0.0f;
+    runLeft = 0;
+    const float rise = (random(100) < 42) ? frnd(4.0f, maxRise()) : 0.0f;
     const float drop = (rise == 0.0f && random(100) < 40) ? frnd(6.0f, 40.0f) : 0.0f;
     top = (int16_t)constrain((float)p.top - rise + drop, (float)TOP_MIN, (float)TOP_MAX);
     actualRise = (float)(p.top - top);
 
-    if (random(100) < (level < 2 ? 45 : 72))
+    if (gapAllowed && random(100) < 66)
       gap = frnd(18.0f, maxGapFor(actualRise));
 
-    w = fmaxf(90.0f, speed * 0.90f) + frnd(0.0f, 90.0f);
-    prevHard = (gap > maxGapFor(actualRise) * 0.7f) || (actualRise > maxRise() * 0.7f);
+    // Segments are at least one escape window wide, so the NEXT gap is always
+    // legally placeable -- otherwise gaps would starve at high level, where
+    // the window is wide relative to a segment.
+    w = sep + frnd(20.0f, 130.0f);
 
-    // Turn this beat into a run. Only from level 2, and never for a step that
-    // also rises -- a repeated flat gap is a rhythm, a repeated staircase is
-    // just a wall.
-    if (level >= 2 && gap > 0.0f && actualRise <= 0.0f && random(100) < 38) {
+    // Turn this beat into a run. Never for a step that also rises: a repeated
+    // flat gap is a rhythm, a repeated staircase is just a wall.
+    if (level >= LV_CRATES && gap > 0.0f && actualRise <= 0.0f && random(100) < 38) {
       runLeft = (uint8_t)random(2, 4);
-      runGap = gap; runRise = 0.0f; runW = w;
-      prevHard = false;              // the run IS the pattern; do not break it
+      runGap = gap; runW = w;
     }
   }
 
   if (nseg >= MAX_SEG) return;
-  segs[nseg++] = { p.x + p.w + gap, w, top };
+  segs[nseg++] = { prevEnd + gap, w, top };
   const Seg &s = segs[nseg - 1];
 
-  // Coins over the gap, following the jump that clears it. The arc starts a
-  // little BEFORE the lip: jumping slightly early is the safe way to clear a
-  // gap, so the coins should reward that rather than punish it.
-  if (gap > 0.0f) coinArc(p.x + p.w - 26.0f, (float)p.top, 4);
+  if (gap > 0.0f) {
+    // Coins over the gap, following the jump that clears it. The arc starts a
+    // little BEFORE the lip: jumping slightly early is the safe way to clear
+    // a gap, so the coins should reward that rather than punish it.
+    coinArc(prevEnd - 26.0f, (float)p.top, 4);
+    nextHazardX = s.x + sep;            // clear ground after the landing edge
+  }
 
-  // Crates: something to hop over. Never near an edge, where the player is
-  // busy landing, and held back until the first stretch has been survived.
-  if (distance > 420.0f && s.w > 118.0f && random(100) < 55) {
-    const float cx = s.x + frnd(48.0f, s.w - 58.0f);
-    if (ncrate < MAX_CRATE) {
-      crates[ncrate++] = { cx, (int16_t)(s.top - CRATE_S) };
-      coinArc(cx - 34.0f, (float)s.top, 3);
-    }
-  } else if (random(100) < 45) {
-    // Otherwise a low row of coins: a free hop, and a hint that up is good.
+  placeHazard(s);
+
+  // Somewhere quiet, a low row of coins: a free hop, and a hint that up is
+  // good. Purely a reward, so it needs no separation of its own.
+  if (random(100) < 40) {
     const float cx = s.x + frnd(40.0f, fmaxf(45.0f, s.w - 60.0f));
     for (uint8_t i = 0; i < 3; i++)
       addCoin(cx + i * 18.0f, (float)s.top - 34.0f);
   }
+}
+
+// Roughly one per level, at an unpredictable point inside it, so it is a
+// thing you happen to catch rather than a thing that happens on schedule.
+static void scheduleEgg() {
+  eggNextDist = distance + frnd(150.0f, LEVEL_DIST * 0.80f);
+}
+
+static void updateEgg(float dt) {
+  if (!egg.active) {
+    if (distance < eggNextDist) return;
+    egg.kind  = (uint8_t)random(EGG_KINDS);
+    egg.phase = 0.0f;
+    const int8_t d = (random(100) < 50) ? 1 : -1;
+    // Slow enough to notice and follow across the sky -- except the shooting
+    // star, which is meant to be a "did you see that?".
+    const float sp = (egg.kind == EGG_PLANE) ? 30.0f
+                   : (egg.kind == EGG_SAT)   ? 18.0f
+                   : (egg.kind == EGG_UFO)   ? 38.0f : 150.0f;
+    const int16_t hi = (egg.kind == EGG_SAT) ? 28 : (egg.kind == EGG_UFO) ? 52 : 44;
+    egg.y  = frnd(10.0f, (float)hi);
+    egg.vx = sp * d;
+    egg.x  = (d > 0) ? -24.0f : (float)(PLAY_W + 24);
+    egg.active = true;
+    eggNextDist = 1e9f;      // exactly one per level; the next level re-arms it
+    Serial.printf("[game] sky: %s\n",
+                  egg.kind == EGG_PLANE ? "airplane" :
+                  egg.kind == EGG_SAT   ? "satellite" :
+                  egg.kind == EGG_UFO   ? "UFO" : "shooting star");
+    return;
+  }
+  egg.x     += egg.vx * dt;
+  egg.phase += 2.2f * dt;
+  if (egg.x < -40.0f || egg.x > PLAY_W + 40.0f) egg.active = false;
 }
 
 static void cullAndTop() {
@@ -440,8 +545,9 @@ static void newGame() {
   for (uint8_t i = 0; i < MAX_PART; i++) parts[i].life = 0;
 
   camX = 0; speed = SPEED_0; level = 1; score = 0; scoreAcc = 0; coinsGot = 0;
-  lives = START_LIVES; distance = 0; prevHard = false; birdCombo = 0;
-  runLeft = 0;
+  lives = START_LIVES; distance = 0; birdCombo = 0;
+  runLeft = 0; nextHazardX = -1e9f;
+  egg.active = false; scheduleEgg();
   invuln = 0; coyote = 0; buffered = 0; usedDouble = false; holding = false;
 
   // Three flat, gapless segments to start on -- nothing to fail at yet, and a
@@ -532,6 +638,7 @@ static void step(float dt) {
   if (want > level) {
     level = want;
     speed = fminf(SPEED_0 * powf(SPEED_STEP, level - 1), SPEED_MAX);
+    scheduleEgg();                     // one sighting per level
     snprintf(banner, sizeof(banner), "LEVEL %u", level);
     bannerUntil = millis() + 1200;
     sfxLevel();
@@ -539,6 +646,7 @@ static void step(float dt) {
                   level, speed, maxGapFor(0));
   }
   cullAndTop();
+  updateEgg(dt);
 
   // --- vertical ---
   const float g = (vy < 0.0f) ? (holding ? G_UP_HELD : G_UP_FREE) : G_DOWN;
@@ -617,27 +725,17 @@ static void step(float dt) {
   }
 
   // --- birds ---
-  // From level 2, and only ever over solid ground: a bird hovering above
-  // water would force a jump into it, which is not a lesson, just a trap.
-  if (level >= 2 && nbird < MAX_BIRD && random(1000) < 9) {
-    const float bx = camX + PLAY_W + 20.0f;
-    const int16_t s = surfaceAt(bx, bx + BIRD_W);
-    if (s != NO_GROUND) {
-      // Two flavours. A LOW bird clears a standing runner's head by a few
-      // pixels but is squarely in the path of a jump -- so it only ever
-      // punishes jumping when you did not need to. That is the whole point:
-      // with one button, deciding NOT to press is the other half of the
-      // skill, and nothing else in the game teaches it.
-      const bool low = random(100) < 55;
-      const float h  = low ? frnd(34.0f, 52.0f) : frnd(60.0f, 82.0f);
-      birds[nbird++] = { bx, (float)s - h, frnd(0, 6.28f), true };
-    }
-  }
+  // Birds are placed by the world generator (see placeHazard) and are STATIC
+  // in world space -- they hover and bob, they do not fly towards you. That
+  // is deliberate: a bird drifting at its own speed re-times itself against
+  // terrain that was laid out much earlier, and will eventually park itself
+  // over a crate. A crate forces a jump, a low bird punishes one, so that
+  // combination is unclearable. Static placement is what makes the
+  // separation guarantee hold for the whole life of the bird.
   for (uint8_t i = 0; i < nbird; i++) {
     Bird &b = birds[i];
-    b.x     -= (speed * 0.45f) * dt;      // they fly towards you
     b.phase += 6.0f * dt;
-    const float by = b.y + sinf(b.phase) * 7.0f;
+    const float by = b.y + sinf(b.phase) * 5.0f;
     if (wx + PLR_W - 3 > b.x && wx + 3 < b.x + BIRD_W &&
         py + PLR_H > by && py < by + BIRD_H) {
       if (vy > 40.0f && py + PLR_H < by + BIRD_H * 0.8f) {
@@ -710,6 +808,60 @@ static void buildBackgroundTables() {
   }
 }
 
+// Each drawn around a centre point, with d = +1 travelling right, -1 left.
+static void eggPlane(int16_t x, int16_t y, int8_t d) {
+  for (uint8_t i = 1; i <= 5; i++) {              // contrail, fading behind
+    const int16_t tx = x - d * (8 + i * 5);
+    const uint16_t c = (i < 3) ? 0x8410 : 0x4208;
+    cv->drawPixel(tx, y + 3, c);
+    cv->drawPixel(tx + 1, y + 3, c);
+  }
+  cv->fillRect(x - 6, y + 2, 12, 3, C_WHITE);     // fuselage
+  cv->fillRect(x + d * 5, y + 3, 3, 2, 0xC618);   // nose
+  cv->fillRect(x - 1, y, 3, 8, 0xC618);           // wings
+  cv->fillRect(x - d * 7, y, 2, 3, 0xC618);       // tail fin
+  if ((millis() / 350) & 1) cv->drawPixel(x + d * 6, y + 3, C_MAG);   // beacon
+}
+
+static void eggSat(int16_t x, int16_t y) {
+  cv->fillRect(x - 3, y, 6, 6, 0xC618);           // body
+  cv->fillRect(x - 11, y + 1, 7, 4, C_CYAN);      // solar panels
+  cv->fillRect(x + 5, y + 1, 7, 4, C_CYAN);
+  cv->drawFastHLine(x - 11, y + 2, 7, 0x035F);
+  cv->drawFastHLine(x + 5, y + 2, 7, 0x035F);
+  if ((millis() / 500) & 1) cv->drawPixel(x, y - 2, C_WHITE);
+}
+
+static void eggUfo(int16_t x, int16_t y) {
+  cv->fillRect(x - 3, y - 3, 7, 3, C_CYAN);       // dome
+  cv->fillRect(x - 9, y, 19, 3, 0xC618);          // saucer
+  cv->fillRect(x - 6, y + 3, 13, 2, 0x8410);
+  const uint8_t f = (millis() / 140) % 3;
+  for (uint8_t i = 0; i < 3; i++)
+    cv->drawPixel(x - 5 + i * 5, y + 5, (i == f) ? C_YELLOW : C_MAG);
+}
+
+static void eggStar(int16_t x, int16_t y, int8_t d) {
+  for (uint8_t i = 0; i < 15; i++) {
+    const uint16_t c = (i < 3) ? C_WHITE : (i < 8 ? 0xAD7F : 0x4A3F);
+    cv->drawPixel(x - d * i, y + i / 3, c);
+  }
+}
+
+static void drawEgg() {
+  if (!egg.active) return;
+  const int16_t x = (int16_t)egg.x;
+  const int8_t  d = (egg.vx >= 0.0f) ? 1 : -1;
+  const int16_t y = (int16_t)(egg.y + ((egg.kind == EGG_UFO)
+                                       ? sinf(egg.phase) * 5.0f : 0.0f));
+  switch (egg.kind) {
+    case EGG_PLANE: eggPlane(x, y, d); break;
+    case EGG_SAT:   eggSat(x, y);      break;
+    case EGG_UFO:   eggUfo(x, y);      break;
+    default:        eggStar(x, y, d);  break;
+  }
+}
+
 static void drawSun() {
   for (int16_t dy = -SUN_R; dy <= SUN_R; dy++) {
     const int16_t y = SUN_Y + dy;
@@ -744,6 +896,7 @@ static void drawBackground() {
   }
 
   drawSun();
+  drawEgg();          // in front of the sun, behind the mountains it sets into
 
   // Mountains, drifting slowly (parallax) so depth reads even at 20 fps.
   const int32_t mo = (int32_t)(camX * 0.30f);
@@ -846,7 +999,7 @@ static void drawWorld() {
   const uint8_t bf = (millis() / 140) % 2;
   for (uint8_t i = 0; i < nbird; i++) {
     const int16_t x = (int16_t)(birds[i].x - camX);
-    const int16_t y = (int16_t)(birds[i].y + sinf(birds[i].phase) * 7.0f);
+    const int16_t y = (int16_t)(birds[i].y + sinf(birds[i].phase) * 5.0f);
     if (x > PLAY_W || x + BIRD_W < 0) continue;
     blitSprite(x, y, bf ? &SPR_BIRD_A[0][0] : &SPR_BIRD_B[0][0], 8, 5, 2);
   }
@@ -1024,6 +1177,32 @@ int gameProbe(float dx) {
   // banks of a small gap and report solid ground over open water.
   return surfaceAt(x + PLR_W / 2 - 1, x + PLR_W / 2 + 1) == NO_GROUND ? 1 : 0;
 }
+// Walk the live world and count genuinely unclearable configurations. The
+// contract is: nothing that FORCES a jump (a gap, a crate) may have a bird
+// anywhere inside the jump arc it forces, and no bird may hover over water.
+// Run every frame by the harness, so "never impossible" is a measured claim
+// rather than an assertion in a comment.
+int gameCheckWorld() {
+  int bad = 0;
+  const float arc = speed * AIRTIME;      // how far a forced jump carries you
+
+  for (uint8_t b = 0; b < nbird; b++) {
+    const float bx0 = birds[b].x, bx1 = birds[b].x + BIRD_W;
+
+    if (surfaceAt(bx0, bx1) == NO_GROUND) bad++;          // bird over water
+
+    for (uint8_t c = 0; c < ncrate; c++)
+      if (bx1 > crates[c].x - arc && bx0 < crates[c].x + CRATE_S + arc) bad++;
+
+    for (uint8_t i = 1; i < nseg; i++) {
+      const float g0 = segs[i - 1].x + segs[i - 1].w, g1 = segs[i].x;
+      if (g1 > g0 && bx1 > g0 - arc && bx0 < g1 + arc) bad++;
+    }
+  }
+  return bad;
+}
+int      gameEggKind()  { return egg.active ? (int)egg.kind : -1; }
+bool     gameEggOnScreen() { return egg.active && egg.x > 60.0f && egg.x < PLAY_W - 60.0f; }
 bool     gameGrounded() { return grounded; }
 int      gameState()    { return (int)state; }
 uint8_t  gameLevel()    { return level; }

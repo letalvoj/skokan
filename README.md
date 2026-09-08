@@ -149,6 +149,17 @@ them:
   Fixed by only clearing the flag inside the critical section, and only if the
   queue is still empty at that instant.
 
+- **Two placement authorities will eventually contradict each other.** Crates
+  were laid out in world coordinates well ahead of the player; birds were
+  spawned at the screen edge at runtime and then drifted left *faster than the
+  world scrolled*. Neither knew about the other, so a bird slowly re-timed
+  itself against terrain decided much earlier and would eventually park over a
+  crate — and a crate forces a jump while a low bird punishes one, so that
+  pair is unclearable. The fix was structural, not a special case: birds
+  became static in world space and every hazard now goes through a single
+  `nextHazardX` cursor. Anything that moves relative to the world cannot be
+  reasoned about at generation time.
+
 - **Anything drawn straight to the panel flickers; there are no exceptions.**
   Everything in the game composes off-screen and blits in one transfer —
   except the HUD, which cleared its bar to black and then drew text back over
@@ -347,15 +358,67 @@ AIRTIME = T_UP + T_DOWN                 ~0.63 s  how long you are off the ground
   distance, so the gap allowance is scaled by `1 − rise / JUMP_H`. Steps up
   are capped at 42 % of the full jump height (~27 px), which means they are
   clearable even with a short hop.
-- **Rhythm**: a segment that was hard (big gap or tall step) forces the next
-  one to be flat, gapless and wide — never two *unrelated* hard things in a
-  row. Deliberate rhythm runs are the exception, and override it.
+### The escape window — one authority, one invariant
+
+The thing that actually makes the world fair isn't any single rule about gaps;
+it's that **every hazard is placed by one authority against one invariant**.
+A single `nextHazardX` cursor says where the next hazard may begin. Gaps,
+crates and birds all read it and all push it forward. Nothing else may place
+anything.
+
+The window it reserves is measured in **seconds of reaction time, not pixels**
+— at 235 px/s the same pixel gap gives less than half the thinking time it
+does at 88, so pixels are the wrong unit for difficulty:
+
+```
+sep = speed × clamp(1.80 − (level−1)×0.11, 0.95, 1.80)   seconds
+```
+
+Narrowing that window is the difficulty ramp: **1.80 s at level 1, 0.95 s from
+level 9 on.** The floor is load-bearing rather than taste — it is comfortably
+longer than `AIRTIME` (0.63 s), which is what guarantees that a jump can never
+carry you into the *next* hazard, at any speed. Don't drop it below `AIRTIME`.
+
+**Birds are static in world space.** They hover and bob; they do not fly
+toward you. That is the other half of the guarantee — see
+[Learnings](#learnings) for the bug that made it necessary.
+
+- **Rhythm**: deliberate rhythm runs repeat one beat and override the pacing
+  jitter, because a repeated obstacle is *easier* than a random one.
 - Landing strips are at least `speed × 0.85` wide, so there is always room to
   land, breathe, and take off again at the current speed.
 
 Because both terms are recomputed from the live speed, the terrain scales
 itself as the game accelerates instead of needing a hand-written table per
 level.
+
+### Proving it, rather than asserting it
+
+"Never impossible" is worth nothing as a comment, so the desktop harness
+checks it on **every generated world state**. `gameCheckWorld()` walks the
+live world and counts genuinely unclearable configurations — anything that
+forces a jump (a gap, a crate) with a bird inside the arc that jump must
+travel, plus any bird hovering over water:
+
+```
+seed 3    unclearable configurations: 0 frames of 12000  --> PASS
+seed 11   unclearable configurations: 0 frames of 12000  --> PASS
+seed 77   unclearable configurations: 0 frames of 12000  --> PASS
+seed 512  unclearable configurations: 0 frames of 12000  --> PASS
+```
+
+The check earns its keep because it was **negative-tested**: reinstating the
+old drifting birds makes it fail immediately (`FIRST VIOLATION at frame 540
+(level 3)`, 282 bad frames of 4000). A test that has never failed proves
+nothing.
+
+### Sky easter eggs
+
+Roughly **one per level**, at an unpredictable point inside it: an airliner
+with a contrail, a satellite with solar panels, a wobbling UFO, or a shooting
+star. They drift across the upper sky, never near the ground, and are
+deliberately quiet — no sound, no banner, one at a time. Spotting one is the
+whole reward.
 
 Coins are placed **along the actual jump parabola** that clears the gap in
 front of them (`coinArc()` integrates the same physics). Collecting the coins

@@ -103,3 +103,6 @@ extern HostSerial Serial;
 #ifndef constrain
 #define constrain(x, lo, hi) ((x) < (lo) ? (lo) : ((x) > (hi) ? (hi) : (x)))
 #endif
+
+// FreeRTOS bits the game touches. There is one "core" on the host.
+inline int xPortGetCoreID() { return 0; }
