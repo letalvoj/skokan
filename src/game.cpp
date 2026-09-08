@@ -1499,7 +1499,7 @@ static void drawTitle() {
   cv->setTextSize(1);
   cv->setTextColor(0x6B5D);
   cv->setCursor(6, PLAY_H - 10);
-  cv->print(F("(C) 2026 VOJTECH LETAL"));
+  cv->print(F("(C) 2026 LETALVOJ.GITHUB.IO"));
 }
 
 // The attract overlay. Deliberately much lighter than the title card: the
@@ -1542,7 +1542,7 @@ static void drawOver() {
   cv->setTextSize(1);
   cv->setTextColor(0x6B5D);
   cv->setCursor(6, PLAY_H - 10);
-  cv->print(F("SKOKAN  (C) 2026 VOJTECH LETAL"));
+  cv->print(F("SKOKAN  (C) 2026 LETALVOJ"));
 }
 
 // HUD and apron live outside the canvas: they change rarely, so drawing them
