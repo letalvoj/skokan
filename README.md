@@ -307,7 +307,12 @@ rather than as death.
 
 ### Rules
 
-- **Coins** (yellow/orange, spinning) — 10 points.
+- **Coins** (yellow/orange, spinning) — 25 points. Deliberately worth enough
+  that collecting is a real strategy rather than a rounding error next to
+  distance points: on a typical short run the score comes out roughly half
+  coins, half distance. The first four coins of every run sit at running
+  height, so they are a free win before a small child has worked the button
+  out at all.
 - **Crates** — jump over them, or land on top; walking into the side costs a
   life. They start once the first stretch has been survived (~420 px in).
 - **Birds** — from level 2. Stomp them from above (50 × combo points) or lose
@@ -441,7 +446,16 @@ games simulate in half a second:
 Skill is one knob (timing error) plus a rate of needless jumps, because those
 are exactly how a small child fails. Three profiles: `4yo`, `8yo`, `ace`.
 The table reports, per level: seconds per run, deaths/min split by cause,
-jumps/s, coins/min, and the survival curve.
+jumps/s, coins collected and the percentage of those spawned, and the
+survival curve.
+
+The bot plays for **score, not just survival**. It solves its own jump arc
+forward (`jumpRise()` is the player's physics integrated) to find coins a
+single jump would actually pass through, rather than hopefully hopping — but
+only with the whole arc clear of the next hazard and never with a bird
+overhead, so chasing coins can never talk it into a death. That took
+collection from incidental to ~70% of every coin spawned, and it matters for
+the attract demo too: a bot that only survives looks like it is asleep.
 
 That table has earned its keep three times over — see
 [Learnings](#learnings) for the fall-through-solid-rock bug it found, which

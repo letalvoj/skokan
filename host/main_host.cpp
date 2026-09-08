@@ -119,6 +119,7 @@ void        gameStatsEndRun();
 void        gameStartNow();
 uint32_t    gameStatFrames(int lv), gameStatJumps(int lv), gameStatCoins(int lv);
 uint32_t    gameStatDeath(int lv, int c), gameStatRuns(), gameStatLevelHist(int lv);
+uint32_t    gameStatCoinSpawn(int lv), gameStatScore();
 int         gameStatLevels();
 float       gameDistance();
 
@@ -151,19 +152,27 @@ static void runStats(int profile, int runs, unsigned seed) {
     for (int i = 0; i < 60; i++) { loop(); hostMillis += FRAME_MS; }
   }
 
+  uint32_t gotAll = 0, spawnAll = 0;
+  for (int lv = 0; lv < gameStatLevels(); lv++) {
+    gotAll += gameStatCoins(lv); spawnAll += gameStatCoinSpawn(lv);
+  }
   const int L = gameStatLevels();
   printf("\n=== bot \"%s\"  %d runs ===\n", gameBotName(profile), runs);
-  printf("  mean distance %.0f m\n", totalDist / runs / 32.0);
-  printf("  lv   secs/run   deaths/min   water  crate   bird   jumps/s  coins/min  alive%%\n");
+  printf("  mean distance %.0f m   mean score %.0f\n",
+         totalDist / runs / 32.0, (double)gameStatScore() / runs);
+  printf("  coins collected %u of %u overall (%.0f%%)\n", gotAll, spawnAll,
+         spawnAll ? 100.0 * gotAll / spawnAll : 0.0);
+  printf("  lv   secs/run   deaths/min   water  crate   bird   jumps/s  coins  got%%  alive%%\n");
   for (int lv = 1; lv < L; lv++) {
     const uint32_t f = gameStatFrames(lv);
     if (!f) continue;
     const double secs = f * (FRAME_MS / 1000.0);
     const uint32_t d0 = gameStatDeath(lv, 0), d1 = gameStatDeath(lv, 1), d2 = gameStatDeath(lv, 2);
     const uint32_t dd = d0 + d1 + d2;
-    printf("  %2d  %8.1f   %10.2f  %5u  %5u  %5u   %7.2f  %9.1f  %5u%%\n",
+    printf("  %2d  %8.1f   %10.2f  %5u  %5u  %5u   %7.2f %6u %5u%% %5u%%\n",
            lv, secs / runs, dd / (secs / 60.0), d0, d1, d2,
-           gameStatJumps(lv) / secs, gameStatCoins(lv) / (secs / 60.0),
+           gameStatJumps(lv) / secs, gameStatCoins(lv),
+           gameStatCoinSpawn(lv) ? (unsigned)(100 * gameStatCoins(lv) / gameStatCoinSpawn(lv)) : 0,
            (unsigned)(100.0 * survivors(lv, runs) / runs));
   }
 }

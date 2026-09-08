@@ -154,6 +154,7 @@ static const float SPEED_MAX  = 235.0f;
 static const float LEVEL_DIST = 900.0f;    // px of ground per level
 
 static const uint8_t START_LIVES = 3;
+static const uint16_t COIN_POINTS = 25;   // vs ~0.12 x speed points/s of distance
 
 // ---------------------------------------------------------------------------
 // Pacing: the escape window.
@@ -241,7 +242,8 @@ static float   eggNextDist;      // spawn the next one when distance passes this
 static const uint8_t STAT_LV = 22;
 uint32_t statFrames[STAT_LV], statJumps[STAT_LV], statCoins[STAT_LV];
 uint32_t statDeath[STAT_LV][3];      // 0 = water, 1 = crate, 2 = bird
-uint32_t statRuns, statLevelHist[STAT_LV], statRunMax;
+uint32_t statRuns, statLevelHist[STAT_LV], statRunMax, statCoinSpawn[STAT_LV];
+uint32_t statScore;
 bool     gHeadless = false;          // skip rendering: rollouts run ~100x faster
 #define STAT(arr)      do { if (level < STAT_LV) arr[level]++; } while (0)
 #define STAT_DEATH(c)  do { if (level < STAT_LV) statDeath[level][c]++; } while (0)
@@ -373,6 +375,7 @@ static float maxRise() { return JUMP_H * 0.42f; }   // ~27 px
 // ---------------------------------------------------------------------------
 static void addCoin(float x, float y) {
   if (ncoin >= MAX_COIN) return;
+  STAT(statCoinSpawn);
   coins[ncoin++] = { x, y, true };
 }
 
@@ -614,7 +617,9 @@ static void newGame() {
   segs[nseg++] = { -80.0f, 400.0f, 138 };
   segs[nseg++] = { 320.0f, 260.0f, 138 };
   py = 138 - PLR_H; vy = 0; grounded = true;
-  for (uint8_t i = 0; i < 4; i++) addCoin(250.0f + i * 20.0f, 138.0f - 32.0f);
+  // At running height, not a hop: the very first coins of a run should be a
+  // free win for a four-year-old who has not worked out the button yet.
+  for (uint8_t i = 0; i < 4; i++) addCoin(250.0f + i * 20.0f, 138.0f - 28.0f);
   cullAndTop();
 
 #ifdef GAME_HOST
@@ -724,6 +729,69 @@ static uint8_t botScan(float *distOut) {
 
 static void tryJump();
 
+// How far the runner rises above its take-off point, t seconds into a jump
+// held for `hold` seconds. This is the player's own physics solved forward,
+// which is what lets the bot aim a jump at something rather than guess.
+static float jumpRise(float t, float hold) {
+  const float v0 = -JUMP_V0;                       // 335 px/s, upward
+  const float th = fminf(hold, v0 / G_UP_HELD);    // held phase, capped at apex
+  if (t <= th) return v0 * t - 0.5f * G_UP_HELD * t * t;
+
+  float y  = v0 * th - 0.5f * G_UP_HELD * th * th;
+  float v  = v0 - G_UP_HELD * th;                  // still climbing if positive
+  float tr = t - th;
+  if (v > 0.0f) {
+    const float tp = v / G_UP_FREE;
+    if (tr <= tp) return y + v * tr - 0.5f * G_UP_FREE * tr * tr;
+    y  += 0.5f * v * tp;
+    tr -= tp;
+  }
+  return y - 0.5f * G_DOWN * tr * tr;
+}
+
+// Jumping is only ever a mistake when a bird is overhead, so that is the only
+// thing a discretionary jump has to check.
+static bool botSafeToJump() {
+  const float wx = camX + PLAYER_X;
+  const float arc = speed * AIRTIME;
+  for (uint8_t i = 0; i < nbird; i++)
+    if (birds[i].x + BIRD_W > wx - 10.0f && birds[i].x < wx + arc + 10.0f)
+      return false;
+  return true;
+}
+
+// The nearest coin a single jump from here would actually pass through, and
+// how long to hold for it. Solving the arc instead of hopefully hopping is
+// what turns "collects some coins by accident" into "goes and gets them".
+static bool botCoinJump(float *holdOut) {
+  const float wx   = camX + PLAYER_X;
+  const float feet = py + PLR_H;
+  static const float HOLDS[4] = { 0.08f, 0.16f, 0.26f, 0.40f };
+
+  float bestDx = 1e9f;
+  bool  found  = false;
+
+  for (uint8_t i = 0; i < ncoin; i++) {
+    if (!coins[i].alive) continue;
+    // Coins at running height get collected without doing anything.
+    if (coins[i].y + COIN_S > feet - PLR_H) continue;
+
+    const float dx = (coins[i].x + COIN_S * 0.5f) - (wx + PLR_W * 0.5f);
+    if (dx < 4.0f || dx >= bestDx) continue;
+    const float t = dx / speed;
+    if (t > AIRTIME * 0.95f) continue;             // not reachable in one jump
+
+    for (uint8_t h = 0; h < 4; h++) {
+      const float top = feet - PLR_H - jumpRise(t, HOLDS[h]);
+      if (top < coins[i].y + COIN_S && top + PLR_H > coins[i].y) {
+        bestDx = dx; *holdOut = HOLDS[h]; found = true;
+        break;
+      }
+    }
+  }
+  return found;
+}
+
 static void botThink(float dt) {
   if (botHoldT > 0.0f) { botHoldT -= dt; botHolding = true; }
   else botHolding = false;
@@ -750,9 +818,24 @@ static void botThink(float dt) {
   // scales with speed, and the jitter is the skill knob: a late take-off
   // drowns you, an early one lands you short.
   const float lead = speed * (0.10f + frnd(-botSkill.jitter, botSkill.jitter));
-  if (d <= lead) {
+  if (kind != 0 && d <= lead) {
     tryJump();
     botHoldT   = (kind == 1) ? 0.26f : 0.15f;   // gap = full jump, crate = hop
+    botHolding = true;
+    return;
+  }
+
+  // Nothing urgent. Survival is not the only thing worth playing for, so go
+  // and get coins -- but only with the whole arc clear of the next hazard,
+  // and never with a bird overhead. Skill gates this too: a child who cannot
+  // time a jump well should not be reliably vacuuming up coins either.
+  if (kind != 0 && d < speed * AIRTIME * 1.15f) return;
+  if (botSkill.jitter > 0.02f && random(100) < (int)(botSkill.jitter * 420.0f)) return;
+
+  float hold;
+  if (botSafeToJump() && botCoinJump(&hold)) {
+    tryJump();
+    botHoldT   = hold;
     botHolding = true;
   }
 }
@@ -946,7 +1029,9 @@ static void step(float dt) {
     if (!c.alive) continue;
     if (wx + PLR_W - 2 > c.x && wx + 2 < c.x + COIN_S &&
         py + PLR_H > c.y && py < c.y + COIN_S) {
-      c.alive = false; coinsGot++; score += 10; STAT(statCoins);
+      // Worth enough that collecting is a real strategy, not a rounding error
+      // next to distance points.
+      c.alive = false; coinsGot++; score += COIN_POINTS; STAT(statCoins);
       puff(c.x - camX + COIN_S / 2, c.y + COIN_S / 2, C_YELLOW, 4);
       sfxCoin();
     }
@@ -1422,6 +1507,8 @@ void gameStatsReset() {
   memset(statCoins,  0, sizeof statCoins);
   memset(statDeath,  0, sizeof statDeath);
   memset(statLevelHist, 0, sizeof statLevelHist);
+  memset(statCoinSpawn, 0, sizeof statCoinSpawn);
+  statScore = 0;
   statRuns = 0;
 }
 // Deepest level a run reached. Losing a life DROPS a level, so counting
@@ -1429,6 +1516,7 @@ void gameStatsReset() {
 void gameStatReached(uint8_t lv) { if (lv > statRunMax) statRunMax = lv; }
 void gameStatsEndRun() {
   statRuns++;
+  statScore += score;
   statLevelHist[statRunMax < STAT_LV ? statRunMax : STAT_LV - 1]++;
   statRunMax = 1;
 }
@@ -1438,6 +1526,8 @@ uint32_t gameStatCoins(int lv)  { return statCoins[lv]; }
 uint32_t gameStatDeath(int lv, int c) { return statDeath[lv][c]; }
 uint32_t gameStatRuns()         { return statRuns; }
 uint32_t gameStatLevelHist(int lv) { return statLevelHist[lv]; }
+uint32_t gameStatCoinSpawn(int lv) { return statCoinSpawn[lv]; }
+uint32_t gameStatScore()          { return statScore; }
 int      gameStatLevels()       { return STAT_LV; }
 float    gameDistance()         { return distance; }
 void     gameStartNow()         { newGame(); }
