@@ -17,3 +17,8 @@ firmware_backups/
 host/skokan
 host/skokan.dSYM/
 host/shots/
+
+# macOS app bundle and generated icon (rebuild with `make app` / `make icon`)
+host/SKOKAN.app/
+host/skokan-play
+host/icon/

@@ -81,3 +81,37 @@ with level, level 1–2 should be near zero, and a better profile should get
 meaningfully further than a worse one. When that last property failed — ace
 scoring the same as a masher — it turned out to be a physics bug, not a
 balance problem.
+
+## Playing it on macOS
+
+```bash
+make play          # build SKOKAN.app and launch it
+```
+
+The app compiles the **same `src/game.cpp`** the board runs, completely
+unmodified. `host/` supplies only what the ESP32 normally would:
+
+| on the board | on macOS |
+|---|---|
+| ILI9341 over SPI | an SDL texture fed the same 320x240 RGB565 framebuffer |
+| `millis()` | the real clock |
+| arcade button (pull-up) | SPACE, mapped to `hostButtonLevel` |
+| MAX98357A over I2S | an SDL audio callback |
+
+`host/synth_sdl.cpp` copies the oscillator and envelope from `src/synth.cpp`
+on purpose: if the chiptune is going to be tuned by ear on a laptop, it has to
+be the same voice that comes out of the speaker. None of the amp workarounds
+(SD wake time, DMA drain) are there — those exist because of the MAX98357A,
+and a sound card has no such problem.
+
+Controls: **SPACE** (or up/W/mouse) is the button — tap to hop, hold for
+height, tap again in mid-air to double jump. `1`/`2`/`3` hand the controls to
+the 4yo/8yo/ace bot, `0` takes them back, `F` changes window size, `ESC`
+quits. Leave the menu alone for five seconds and attract mode starts, exactly
+as on the board.
+
+The icon is **rendered by a program** (`host/icon.cpp`), not cropped from a
+screenshot — a screenshot crop is unreadable at 32 px, all HUD and text. It
+follows Apple's icon grid: a centred 824x824 rounded square on a 1024 canvas,
+transparent outside, because a full-bleed square reads as broken next to every
+other icon in the Dock.

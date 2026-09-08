@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>                  <string>SKOKAN</string>
+	<key>CFBundleDisplayName</key>           <string>SKOKAN</string>
+	<key>CFBundleIdentifier</key>            <string>com.mluvitko.skokan</string>
+	<key>CFBundleExecutable</key>            <string>SKOKAN</string>
+	<key>CFBundleIconFile</key>              <string>AppIcon</string>
+	<key>CFBundlePackageType</key>           <string>APPL</string>
+	<key>CFBundleSignature</key>             <string>????</string>
+	<key>CFBundleShortVersionString</key>    <string>1.0</string>
+	<key>CFBundleVersion</key>               <string>1</string>
+	<key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
+	<key>LSMinimumSystemVersion</key>        <string>11.0</string>
+	<key>LSApplicationCategoryType</key>     <string>public.app-category.arcade-games</string>
+	<!-- The art is 2x2 pixel blocks; let the window scale crisply on Retina. -->
+	<key>NSHighResolutionCapable</key>       <true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key> <true/>
+	<key>NSHumanReadableCopyright</key>      <string>mluvitko — built with an 8-year-old co-designer</string>
+</dict>
+</plist>
