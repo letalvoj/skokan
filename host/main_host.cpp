@@ -24,6 +24,7 @@ uint8_t  gameLevel();
 uint32_t gameScore();
 
 bool hostWriteBMP(const char *path, const uint16_t *fb, int w, int h, int scale);
+static int realMain(int argc, char **argv);
 
 static const uint32_t FRAME_MS = 45;    // ~22 fps, the rate the board should hit
 static const int      SCALE    = 3;
@@ -104,7 +105,97 @@ void hostFrameDone() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Measured rollouts. Headless (no rendering) so a few hundred games of play
+// simulate in a second or two, and the difficulty of each level can be read
+// off as numbers rather than argued about.
+// ---------------------------------------------------------------------------
+extern bool gHeadless;
+extern bool hostQuiet;
+void        gameSetBot(int profile, bool drive);
+const char *gameBotName(int profile);
+void        gameStatsReset();
+void        gameStatsEndRun();
+void        gameStartNow();
+uint32_t    gameStatFrames(int lv), gameStatJumps(int lv), gameStatCoins(int lv);
+uint32_t    gameStatDeath(int lv, int c), gameStatRuns(), gameStatLevelHist(int lv);
+int         gameStatLevels();
+float       gameDistance();
+
+// Runs that got at least this far: a reverse cumulative of the max-level
+// histogram, which is the survival curve.
+static uint32_t survivors(int lv, int runs) {
+  uint32_t n = 0;
+  for (int k = lv; k < gameStatLevels(); k++) n += gameStatLevelHist(k);
+  return n;
+}
+
+static void runStats(int profile, int runs, unsigned seed) {
+  gHeadless = true;
+  hostQuiet = true;          // the game logs per-frame; keep the table readable
+  srand(seed);
+  setup();
+  gameStatsReset();
+
+  double totalDist = 0.0;
+  for (int r = 0; r < runs; r++) {
+    gameStartNow();          // newGame() clears botDrive, so arm the bot AFTER
+    gameSetBot(profile, true);
+    for (int guard = 0; guard < 40000 && gameState() == 1; guard++) {
+      loop();
+      hostMillis += FRAME_MS;
+    }
+    totalDist += gameDistance();
+    gameStatsEndRun();
+    // Clear the game-over screen so the next run starts fresh.
+    for (int i = 0; i < 60; i++) { loop(); hostMillis += FRAME_MS; }
+  }
+
+  const int L = gameStatLevels();
+  printf("\n=== bot \"%s\"  %d runs ===\n", gameBotName(profile), runs);
+  printf("  mean distance %.0f m\n", totalDist / runs / 32.0);
+  printf("  lv   secs/run   deaths/min   water  crate   bird   jumps/s  coins/min  alive%%\n");
+  for (int lv = 1; lv < L; lv++) {
+    const uint32_t f = gameStatFrames(lv);
+    if (!f) continue;
+    const double secs = f * (FRAME_MS / 1000.0);
+    const uint32_t d0 = gameStatDeath(lv, 0), d1 = gameStatDeath(lv, 1), d2 = gameStatDeath(lv, 2);
+    const uint32_t dd = d0 + d1 + d2;
+    printf("  %2d  %8.1f   %10.2f  %5u  %5u  %5u   %7.2f  %9.1f  %5u%%\n",
+           lv, secs / runs, dd / (secs / 60.0), d0, d1, d2,
+           gameStatJumps(lv) / secs, gameStatCoins(lv) / (secs / 60.0),
+           (unsigned)(100.0 * survivors(lv, runs) / runs));
+  }
+}
+
+// Never touch the button: the menu should time out and the bot take over.
+static int runAttract(unsigned seed) {
+  srand(seed);
+  setup();
+  hostButtonLevel = HIGH;
+  for (frameNo = 0; frameNo < 700; frameNo++) {
+    loop();
+    if (frameNo == 60)  capture("10-menu-idle");
+    if (frameNo == 220) capture("11-attract-demo");
+    if (frameNo == 480) capture("12-attract-later");
+    hostMillis += FRAME_MS;
+  }
+  return 0;
+}
+
 int main(int argc, char **argv) {
+  if (argc > 1 && strcmp(argv[1], "--attract") == 0)
+    return runAttract(argc > 2 ? (unsigned)atoi(argv[2]) : 4);
+  if (argc > 1 && strcmp(argv[1], "--stats") == 0) {
+    const int runs = (argc > 2) ? atoi(argv[2]) : 150;
+    const unsigned seed = (argc > 3) ? (unsigned)atoi(argv[3]) : 1;
+    for (int p = 0; p < 3; p++) runStats(p, runs, seed + p * 977);
+    return 0;
+  }
+  return realMain(argc, argv);
+}
+
+static int realMain(int argc, char **argv) {
   const uint32_t total = (argc > 1) ? (uint32_t)atoi(argv[1]) : 1400;
   const unsigned seed  = (argc > 2) ? (unsigned)atoi(argv[2]) : 7;
   if (argc > 3) snprintf(outDir, sizeof(outDir), "%s", argv[3]);

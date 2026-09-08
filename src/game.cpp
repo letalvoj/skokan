@@ -149,7 +149,7 @@ static const float AIRTIME = T_UP + T_DOWN;                                     
 // Speed ramp. Deliberately slow at the start -- a 4-year-old has to be able
 // to see the gap coming before it arrives.
 static const float SPEED_0    = 88.0f;     // px/s at level 1
-static const float SPEED_STEP = 1.115f;    // per level
+static const float SPEED_STEP = 1.078f;    // per level, spread over DIFF_LEVELS
 static const float SPEED_MAX  = 235.0f;
 static const float LEVEL_DIST = 900.0f;    // px of ground per level
 
@@ -170,8 +170,14 @@ static const uint8_t START_LIVES = 3;
 // AIRTIME (0.63 s), which is what guarantees a jump can never carry you into
 // the next hazard, at any speed. Do not drop it below AIRTIME.
 static const float SEP_T0     = 1.80f;   // seconds of clear ground at level 1
-static const float SEP_T_STEP = 0.11f;   // shaved off per level
-static const float SEP_T_MIN  = 0.95f;   // floor -- see above
+static const float SEP_T_MIN  = 0.80f;   // floor -- see above
+
+// Difficulty is one normalised ramp, 0 at level 1 and 1 at DIFF_LEVELS, and
+// every knob reads it. Before this, speed capped at level 11 and the escape
+// window floored at level 9, so from level 9 on the game stopped getting
+// harder at all -- measured as a dead-flat 0.3 deaths/min from level 4 to 13.
+static const uint8_t DIFF_LEVELS = 14;
+static float diffT();          // defined once `level` exists, below
 
 // Which hazards exist yet. One new skill at a time, so a four-year-old is
 // never learning two things at once.
@@ -200,6 +206,9 @@ static Part  parts[MAX_PART];
 static float    camX;              // world x at the left edge of the screen
 static float    speed;             // px/s
 static uint8_t  level;
+static float diffT() {
+  return constrain((float)(level - 1) / (float)(DIFF_LEVELS - 1), 0.0f, 1.0f);
+}
 static uint32_t score, best;
 static uint16_t coinsGot;
 static uint8_t  lives;
@@ -224,6 +233,44 @@ enum EggKind : uint8_t { EGG_PLANE = 0, EGG_SAT, EGG_UFO, EGG_STAR, EGG_KINDS };
 struct SkyEgg { uint8_t kind; float x, y, vx, phase; bool active; };
 static SkyEgg  egg;
 static float   eggNextDist;      // spawn the next one when distance passes this
+
+// ---- measurement (desktop harness only) -----------------------------------
+// Per-level counters, so difficulty can be looked at as numbers instead of
+// vibes. Compiled out of the firmware entirely.
+#ifdef GAME_HOST
+static const uint8_t STAT_LV = 22;
+uint32_t statFrames[STAT_LV], statJumps[STAT_LV], statCoins[STAT_LV];
+uint32_t statDeath[STAT_LV][3];      // 0 = water, 1 = crate, 2 = bird
+uint32_t statRuns, statLevelHist[STAT_LV], statRunMax;
+bool     gHeadless = false;          // skip rendering: rollouts run ~100x faster
+#define STAT(arr)      do { if (level < STAT_LV) arr[level]++; } while (0)
+#define STAT_DEATH(c)  do { if (level < STAT_LV) statDeath[level][c]++; } while (0)
+#else
+#define STAT(arr)      do {} while (0)
+#define STAT_DEATH(c)  do {} while (0)
+#endif
+
+// ---- the bot ---------------------------------------------------------------
+// Skill is one knob -- timing error -- plus a rate of needless jumps. Those
+// are exactly the two ways a small child fails: mistimed take-offs, and
+// pressing the button when nothing asked them to.
+struct BotSkill {
+  float   jitter;      // +/- seconds of error on the take-off point
+  uint8_t sloppyPct;   // chance per second of a pointless jump
+  const char *name;
+};
+static const BotSkill BOT_PROFILES[] = {
+  { 0.090f, 26, "4yo" },     // mashy, poor timing
+  { 0.045f,  8, "8yo" },     // decent, occasionally excited
+  { 0.012f,  0, "ace" },     // near-perfect reference
+};
+static const uint8_t BOT_KINDS = 3;
+
+static BotSkill botSkill   = BOT_PROFILES[1];
+static bool     botDrive   = false;   // the bot has the controls
+static bool     botHolding = false;
+static float    botHoldT   = 0.0f;
+static float    botSloppyT = 0.0f;
 
 enum State : uint8_t { ST_TITLE, ST_PLAY, ST_OVER };
 static State state = ST_TITLE;
@@ -306,10 +353,14 @@ static void blitSprite(int16_t x, int16_t y, const uint8_t *d,
 // Because both terms are computed from the live `speed`, the terrain scales
 // itself as the game accelerates instead of needing a per-level table.
 // ---------------------------------------------------------------------------
-static const float SAFETY = 0.58f;
+// How much of a full jump a gap is allowed to consume. It ramps too: level 1
+// asks for less than half the runner's reach, the top of the curve asks for
+// nearly three quarters. Never anywhere near 1.0 -- that would demand a
+// perfectly timed, fully held jump every time.
+static float safetyNow() { return 0.45f + 0.27f * diffT(); }
 
 static float maxGapFor(float rise) {
-  const float reach   = speed * AIRTIME * SAFETY;
+  const float reach   = speed * AIRTIME * safetyNow();
   const float heightF = (rise > 0.0f) ? (1.0f - rise / JUMP_H) : 1.0f;
   return constrain(reach * heightF, 16.0f, 130.0f);
 }
@@ -347,7 +398,7 @@ static float   runGap, runW;
 
 // The escape window in pixels, at the current speed and level.
 static float hazardSep() {
-  const float t = constrain(SEP_T0 - (level - 1) * SEP_T_STEP, SEP_T_MIN, SEP_T0);
+  const float t = SEP_T0 + (SEP_T_MIN - SEP_T0) * diffT();
   return speed * t;
 }
 
@@ -361,10 +412,10 @@ static void placeHazard(const Seg &s) {
   const float lo  = fmaxf(s.x + 46.0f, nextHazardX);
   const float hi  = s.x + s.w - 54.0f;
   if (lo > hi) return;                           // no legal room on this one
-  if (random(100) > 62) return;                  // not every segment gets one
+  if (random(100) > 60 + (int)(24 * diffT())) return;   // density ramps too
 
   const float x = frnd(lo, hi);
-  const bool  wantBird = (level >= LV_BIRDS_LOW) && (random(100) < 48);
+  const bool  wantBird = (level >= LV_BIRDS_LOW) && (random(100) < 40 + (int)(22 * diffT()));
 
   if (wantBird && nbird < MAX_BIRD) {
     // LOW birds clear a standing runner's head by a few pixels, so they are
@@ -540,6 +591,10 @@ static void puff(float x, float y, uint16_t col, uint8_t n) {
 // ---------------------------------------------------------------------------
 // Reset / start
 // ---------------------------------------------------------------------------
+// How long the menu sits still before the bot starts playing behind it.
+static const uint32_t ATTRACT_AFTER_MS = 5000;
+static bool attract = false;          // a demo game is running under the menu
+
 static void newGame() {
   nseg = ncoin = ncrate = nbird = 0;
   for (uint8_t i = 0; i < MAX_PART; i++) parts[i].life = 0;
@@ -547,18 +602,24 @@ static void newGame() {
   camX = 0; speed = SPEED_0; level = 1; score = 0; scoreAcc = 0; coinsGot = 0;
   lives = START_LIVES; distance = 0; birdCombo = 0;
   runLeft = 0; nextHazardX = -1e9f;
+  attract = botDrive = false;   // a real game; startAttract re-arms them
   egg.active = false; scheduleEgg();
   invuln = 0; coyote = 0; buffered = 0; usedDouble = false; holding = false;
 
   // Three flat, gapless segments to start on -- nothing to fail at yet, and a
   // low row of coins so the very first thing that happens is a small win.
-  segs[nseg++] = { -80.0f, 460.0f, 138 };
-  segs[nseg++] = { 380.0f, 300.0f, 138 };
-  segs[nseg++] = { 680.0f, 300.0f, 138 };
+  // Two flat segments, not three: the old intro was 1060 px and level 1 is
+  // only 900, so the tutorial WAS the whole first level -- measured as 10.3 s
+  // with zero jumps and zero deaths.
+  segs[nseg++] = { -80.0f, 400.0f, 138 };
+  segs[nseg++] = { 320.0f, 260.0f, 138 };
   py = 138 - PLR_H; vy = 0; grounded = true;
   for (uint8_t i = 0; i < 4; i++) addCoin(250.0f + i * 20.0f, 138.0f - 32.0f);
   cullAndTop();
 
+#ifdef GAME_HOST
+  { void gameStatReached(uint8_t); gameStatReached(1); }
+#endif
   g_lastHud = 0xFFFFFFFF;
   banner[0] = 0;
   state = ST_PLAY; stateSince = millis();
@@ -569,6 +630,7 @@ static void newGame() {
 
 static void hurt(const char *why) {
   if (invuln > 0.0f) return;
+  STAT_DEATH(why[0] == 'w' ? 0 : (why[0] == 'c' ? 1 : 2));
   lives = (lives > 0) ? lives - 1 : 0;
   invuln = 1.6f;
   birdCombo = 0;
@@ -611,7 +673,101 @@ static bool readButton() {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// The bot.
+//
+// It drives the SAME virtual button a child does -- it calls tryJump() and
+// sets `holding`, so it is subject to every rule the player is: debounce-free
+// but coyote time, jump buffering and hold-for-height all apply. That is the
+// point: a bot that cheated its way past the physics would measure nothing.
+//
+// It is used for two things: the arcade attract mode on the board, and
+// measuring how hard the game actually is on the desktop harness.
+//
+// Skill is one knob -- timing error -- plus a "sloppy" rate of needless jumps.
+// Those two are exactly the ways a small child fails: mistimed take-offs, and
+// pressing the button when nothing asked them to (which the low birds punish).
+// ---------------------------------------------------------------------------
+// The next thing ahead that actually requires a jump, and how far away it is.
+// Birds are deliberately absent: every bird is placed above a standing
+// runner's head, so NOT jumping is always safe, and the separation invariant
+// guarantees no bird ever sits inside a jump the terrain forces. The bot
+// therefore never needs to react to one -- it only has to not be silly.
+static uint8_t botScan(float *distOut) {
+  const float wx = camX + PLAYER_X;
+  const float horizon = speed * 1.3f;
+  uint8_t kind = 0;
+  float   best = 1e9f;
+
+  for (uint8_t i = 1; i < nseg; i++) {
+    const float g0 = segs[i - 1].x + segs[i - 1].w;
+    if (segs[i].x > g0) {                       // a real gap
+      const float d = g0 - (wx + PLR_W * 0.5f);
+      if (d > -6.0f && d < horizon && d < best) { best = d; kind = 1; }
+    }
+  }
+  for (uint8_t i = 0; i < ncrate; i++) {
+    const float d = crates[i].x - (wx + PLR_W);
+    if (d > -6.0f && d < horizon && d < best) { best = d; kind = 2; }
+  }
+  // Step-ups need a hop too. Leaving these out was why the bot looked no
+  // better than a masher: it was walking into every ledge in the game.
+  for (uint8_t i = 1; i < nseg; i++) {
+    if (segs[i].top < segs[i - 1].top - 5 && segs[i].x <= segs[i - 1].x + segs[i - 1].w + 1.0f) {
+      const float d = segs[i].x - (wx + PLR_W);
+      if (d > -6.0f && d < horizon && d < best) { best = d; kind = 2; }
+    }
+  }
+  *distOut = best;
+  return kind;
+}
+
+static void tryJump();
+
+static void botThink(float dt) {
+  if (botHoldT > 0.0f) { botHoldT -= dt; botHolding = true; }
+  else botHolding = false;
+
+  // Press the button for no reason now and then. This is not noise for its
+  // own sake -- it is the behaviour the low birds exist to punish, so it is
+  // what makes the difficulty numbers mean something for a small child.
+  botSloppyT -= dt;
+  if (botSkill.sloppyPct && botSloppyT <= 0.0f) {
+    botSloppyT = 0.35f;
+    if (random(100) < (int)(botSkill.sloppyPct * 0.35f)) {
+      tryJump(); botHoldT = 0.10f; botHolding = true;
+      return;
+    }
+  }
+
+  if (!grounded && coyote <= 0.0f) return;      // nothing to start from
+
+  float d;
+  const uint8_t kind = botScan(&d);
+  if (kind == 0) return;
+
+  // Take off slightly before the obstacle. The lead is in seconds so it
+  // scales with speed, and the jitter is the skill knob: a late take-off
+  // drowns you, an early one lands you short.
+  const float lead = speed * (0.10f + frnd(-botSkill.jitter, botSkill.jitter));
+  if (d <= lead) {
+    tryJump();
+    botHoldT   = (kind == 1) ? 0.26f : 0.15f;   // gap = full jump, crate = hop
+    botHolding = true;
+  }
+}
+
+// Start a demo: same game, same rules, bot on the sticks.
+static void startAttract() {
+  newGame();
+  attract  = true;
+  botDrive = true;
+  botSkill = BOT_PROFILES[1];       // plays like a competent 8-year-old
+  Serial.println(F("[game] attract mode: bot playing"));
+}
+
 static void tryJump() {
+  STAT(statJumps);
   if (grounded || coyote > 0.0f) {
     vy = JUMP_V0; grounded = false; coyote = 0; usedDouble = false;
     birdCombo = 0;
@@ -633,11 +789,15 @@ static void step(float dt) {
   // --- horizontal: the world moves, the runner does not ---
   camX     += speed * dt;
   distance += speed * dt;
+  STAT(statFrames);
 
   const uint8_t want = (uint8_t)(distance / LEVEL_DIST) + 1;
   if (want > level) {
     level = want;
     speed = fminf(SPEED_0 * powf(SPEED_STEP, level - 1), SPEED_MAX);
+#ifdef GAME_HOST
+    { void gameStatReached(uint8_t); gameStatReached(level); }
+#endif
     scheduleEgg();                     // one sighting per level
     snprintf(banner, sizeof(banner), "LEVEL %u", level);
     bannerUntil = millis() + 1200;
@@ -664,16 +824,43 @@ static void step(float dt) {
     if (wx + PLR_W - 2 > c.x && wx + 2 < c.x + CRATE_S && c.top < sup) sup = c.top;
   }
 
+  // Ground under the CENTRE only. The wide sample above is deliberately
+  // forgiving about landing on a lip, but it also straddles a small gap, so
+  // it must never be what decides you are standing on something. The centre
+  // sample is what tells a real platform from a hole.
+  int16_t supMid = surfaceAt(wx + PLR_W * 0.5f - 2.0f, wx + PLR_W * 0.5f + 2.0f);
+  for (uint8_t i = 0; i < ncrate; i++) {
+    const Crate &c = crates[i];
+    if (wx + PLR_W * 0.5f + 2.0f > c.x && wx + PLR_W * 0.5f - 2.0f < c.x + CRATE_S
+        && c.top < supMid) supMid = c.top;
+  }
+
   const bool wasGrounded = grounded;
   grounded = false;
-  // You may only be snapped up onto a surface you were ABOVE last frame (or
-  // barely below, to forgive clipping the lip of a step). Without this test
-  // the wide left/right foot sampling above rescues you from narrow gaps --
-  // your shoulders still overlap the far bank, so falling in "landed" you.
-  // That was the shallow-water bug: small ponds simply did not kill.
-  const float SNAP_TOL = 9.0f;
-  if (sup != NO_GROUND && vy >= 0.0f &&
-      py + PLR_H >= (float)sup && prevBottom <= (float)sup + SNAP_TOL) {
+
+  // Two different ways to end up standing, needing two different tolerances.
+  //
+  // 1. Landing from above (wide sample, TIGHT tolerance): you must have been
+  //    above the surface last frame. Without that test the wide foot sampling
+  //    rescues you from a narrow gap, because your shoulders still overlap
+  //    the far bank -- the shallow-water bug, where small ponds did not kill.
+  //
+  // 2. Climbing a step that scrolled INTO you (centre sample, generous
+  //    tolerance): the world moves and the runner cannot back away, so a step
+  //    up you failed to clear leaves you embedded in its wall, already well
+  //    below its surface. Without this branch you then sink THROUGH solid
+  //    rock into the water -- which turned out to be ~97% of all drownings,
+  //    none of them anywhere near a gap. It cannot rescue anyone from a hole,
+  //    because it requires your centre to be over solid ground.
+  const float SNAP_TOL  = 9.0f;
+  const float CLIMB_TOL = maxRise() + 10.0f;
+  const bool  landing = (sup != NO_GROUND && py + PLR_H >= (float)sup &&
+                         prevBottom <= (float)sup + SNAP_TOL);
+  const bool  climbing = (supMid != NO_GROUND && py + PLR_H >= (float)supMid &&
+                          py + PLR_H <= (float)supMid + CLIMB_TOL);
+  if (climbing && (!landing || supMid < sup)) sup = supMid;
+
+  if (vy >= 0.0f && (landing || climbing) && sup != NO_GROUND) {
     py = (float)sup - PLR_H;
     if (vy > 260.0f) puff(PLAYER_X + PLR_W / 2, py + PLR_H, C_CYAN, 3);
     vy = 0; grounded = true; usedDouble = false; birdCombo = 0;
@@ -759,7 +946,7 @@ static void step(float dt) {
     if (!c.alive) continue;
     if (wx + PLR_W - 2 > c.x && wx + 2 < c.x + COIN_S &&
         py + PLR_H > c.y && py < c.y + COIN_S) {
-      c.alive = false; coinsGot++; score += 10;
+      c.alive = false; coinsGot++; score += 10; STAT(statCoins);
       puff(c.x - camX + COIN_S / 2, c.y + COIN_S / 2, C_YELLOW, 4);
       sfxCoin();
     }
@@ -1055,6 +1242,25 @@ static void drawTitle() {
   blitSprite(PLAYER_X, TOP_MAX - PLR_H + bob, &SPR_RUN_A[0][0], 8, 10, 2);
 }
 
+// The attract overlay. Deliberately much lighter than the title card: the
+// logo, a DEMO tag and a blinking prompt, and nothing else -- the whole point
+// is that a child watches the bot play and wants a go.
+static void drawAttract() {
+  cv->setTextSize(3);
+  cv->setTextColor(C_DARK); cv->setCursor(74, 10); cv->print(F("SKOKAN"));
+  cv->setTextColor(C_CYAN); cv->setCursor(72,  8); cv->print(F("SKOKAN"));
+
+  cv->setTextSize(1);
+  cv->setTextColor(C_MAG);
+  cv->setCursor(196, 12); cv->print(F("DEMO"));
+
+  if ((millis() / 450) & 1) {
+    const int16_t y = PLAY_H - 26;
+    cv->setTextColor(C_DARK);  cv->setCursor(74, y + 1); cv->print(F("PRESS TO PLAY!"));
+    cv->setTextColor(C_WHITE); cv->setCursor(73, y);     cv->print(F("PRESS TO PLAY!"));
+  }
+}
+
 static void drawOver() {
   panel(26, 22, 268, 106);
 
@@ -1130,9 +1336,10 @@ static void drawHud() {
 
 static void render() {
   drawBackground();
-  if (state == ST_TITLE)     { drawWorld(); drawTitle(); }
-  else if (state == ST_OVER) { drawWorld(); drawOver();  }
-  else                         drawWorld();
+  drawWorld();
+  if      (state == ST_TITLE) drawTitle();
+  else if (state == ST_OVER)  { if (!attract) drawOver(); }
+  else if (attract)           drawAttract();
 
   // One bulk SPI transfer. Must go through `tft`, not `gfx` -- see display.h.
   tft->drawRGBBitmap(0, PLAY_Y, cv->getBuffer(), PLAY_W, PLAY_H);
@@ -1201,6 +1408,40 @@ int gameCheckWorld() {
   }
   return bad;
 }
+// Hand the controls to the bot at a chosen skill, for measured rollouts.
+void gameSetBot(int profile, bool drive) {
+  botSkill = BOT_PROFILES[profile % BOT_KINDS];
+  botDrive = drive;
+  attract  = false;
+}
+const char *gameBotName(int profile) { return BOT_PROFILES[profile % BOT_KINDS].name; }
+
+void gameStatsReset() {
+  memset(statFrames, 0, sizeof statFrames);
+  memset(statJumps,  0, sizeof statJumps);
+  memset(statCoins,  0, sizeof statCoins);
+  memset(statDeath,  0, sizeof statDeath);
+  memset(statLevelHist, 0, sizeof statLevelHist);
+  statRuns = 0;
+}
+// Deepest level a run reached. Losing a life DROPS a level, so counting
+// level-up events would over-count the same level many times per run.
+void gameStatReached(uint8_t lv) { if (lv > statRunMax) statRunMax = lv; }
+void gameStatsEndRun() {
+  statRuns++;
+  statLevelHist[statRunMax < STAT_LV ? statRunMax : STAT_LV - 1]++;
+  statRunMax = 1;
+}
+uint32_t gameStatFrames(int lv) { return statFrames[lv]; }
+uint32_t gameStatJumps(int lv)  { return statJumps[lv]; }
+uint32_t gameStatCoins(int lv)  { return statCoins[lv]; }
+uint32_t gameStatDeath(int lv, int c) { return statDeath[lv][c]; }
+uint32_t gameStatRuns()         { return statRuns; }
+uint32_t gameStatLevelHist(int lv) { return statLevelHist[lv]; }
+int      gameStatLevels()       { return STAT_LV; }
+float    gameDistance()         { return distance; }
+void     gameStartNow()         { newGame(); }
+
 int      gameEggKind()  { return egg.active ? (int)egg.kind : -1; }
 bool     gameEggOnScreen() { return egg.active && egg.x > 60.0f && egg.x < PLAY_W - 60.0f; }
 bool     gameGrounded() { return grounded; }
@@ -1278,14 +1519,23 @@ void loop() {
       camX += 30.0f * dt;               // the world drifts behind the title
       cullAndTop();                     // ...and keeps generating, so it never runs out
       if (pressed) { newGame(); sfxLevel(); }
+      else if (now - stateSince > ATTRACT_AFTER_MS) startAttract();
       break;
     case ST_PLAY:
-      if (pressed) tryJump();
-      step(dt);
+      // The bot drives in attract mode, and on the desktop harness when it is
+      // measuring. Either way it goes through tryJump() like a player would.
+      if (botDrive) { botThink(dt); holding = botHolding; }
+      else if (pressed) tryJump();
+      if (attract && pressed) { newGame(); sfxLevel(); }   // a child took over
+      else step(dt);
       break;
     case ST_OVER:
       synthHoldAmp(false);
-      if (pressed && now - stateSince > 1200) { state = ST_TITLE; stateSince = now; }
+      // A demo that ended goes quietly back to the menu rather than sitting
+      // on a GAME OVER card nobody played for.
+      if (attract && now - stateSince > 1500) { attract = botDrive = false;
+                                                state = ST_TITLE; stateSince = now; }
+      else if (pressed && now - stateSince > 1200) { state = ST_TITLE; stateSince = now; }
       break;
   }
 
@@ -1298,8 +1548,12 @@ void loop() {
   ledcWrite(0, duty);
 
   const uint32_t t0 = micros();
+#ifdef GAME_HOST
+  if (!gHeadless) { render(); drawHud(); }
+#else
   render();
   drawHud();
+#endif
   const uint32_t frameUs = micros() - t0;
   renderUs += frameUs;
 

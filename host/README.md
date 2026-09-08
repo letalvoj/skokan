@@ -57,3 +57,27 @@ nearest-neighbour so the 2x2 pixel art stays crisp.
 It renders the same pixels the panel gets, but it cannot tell you about SPI
 timing, DMA, the amp's wake latency, button bounce, or whether the display's
 colour order is right on the real module. Those still need the board.
+
+## Measuring difficulty
+
+```bash
+./host/skokan --stats 400     # ~1200 games in half a second
+./host/skokan --attract       # capture the arcade attract screens
+```
+
+`--stats` runs the firmware's own bot headless (rendering skipped) at three
+skill profiles and prints, per level: seconds per run, deaths per minute split
+by cause, jumps/s, coins/min, and a survival curve. Skill is one knob — timing
+error — plus a rate of needless jumps, which are the two ways a small child
+actually fails.
+
+The bot is not a harness toy: it lives in `src/game.cpp` and is the same code
+that plays the attract mode on the board. It drives the same virtual button a
+child does, so it is bound by coyote time, jump buffering and hold-for-height.
+A bot that bypassed the physics would measure nothing.
+
+Read the table for *shape*, not absolutes: deaths/min should rise monotonically
+with level, level 1–2 should be near zero, and a better profile should get
+meaningfully further than a worse one. When that last property failed — ace
+scoring the same as a masher — it turned out to be a physics bug, not a
+balance problem.

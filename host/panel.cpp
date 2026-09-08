@@ -6,6 +6,7 @@
 uint32_t hostMillis      = 0;
 int      hostButtonLevel = HIGH;   // pull-up: HIGH = released
 int      hostLedDuty     = 0;
+bool     hostQuiet       = false;
 
 int  digitalRead(int) { return hostButtonLevel; }
 void ledcSetup(int, int, int) {}

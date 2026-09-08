@@ -149,6 +149,31 @@ them:
   Fixed by only clearing the flag inside the critical section, and only if the
   queue is still empty at that instant.
 
+- **A bot that plays the game finds bugs that playing it does not.** Adding
+  per-level metrics immediately showed two things nobody had spotted. First,
+  level 1 was *empty*: the hardcoded intro segments totalled 1060 px and a
+  level is 900, so the tutorial was the entire first level — 10.3 seconds,
+  zero jumps, zero deaths. Second, and much worse, a near-perfect bot died
+  exactly as often as a deliberately sloppy one (243 m vs 230 m). Skill not
+  mattering is a very loud signal that deaths are not skill-based. Logging
+  every drowning showed **97% of them happened where there was no gap at
+  all**: a step up that scrolled into the runner left them embedded in its
+  wall, the landing test refused them (they were far below its surface), and
+  they sank *through solid rock* into the water. That was the `SNAP_TOL = 9`
+  fix for the shallow-water bug creating a new bug at the other end. Both
+  cases are distinguishable — a hole has no ground under your centre, a step
+  does — so landing now uses a wide sample with a tight tolerance and
+  climbing uses a centre sample with a generous one. Fixing it moved the
+  three bots from 230/241/243 m to **1129/4579/12384 m**: skill suddenly
+  mattered, which is what said the fix was right.
+
+- **Difficulty that ramps by two knobs stops ramping when both cap.** Speed
+  capped at level 11 and the escape window floored at level 9, so from level 9
+  on the game got no harder — visible as a dead-flat 0.3 deaths/min from level
+  4 to 13. Replaced with one normalised `diffT()` ramp that speed, gap size,
+  hazard density and the escape window all read, giving a monotone curve
+  (0.19 → 2.58 deaths/min for the youngest profile).
+
 - **Two placement authorities will eventually contradict each other.** Crates
   were laid out in world coordinates well ahead of the player; birds were
   spawned at the screen edge at runtime and then drifted left *faster than the
@@ -391,6 +416,36 @@ toward you. That is the other half of the guarantee — see
 Because both terms are recomputed from the live speed, the terrain scales
 itself as the game accelerates instead of needing a hand-written table per
 level.
+
+### The bot, and measuring difficulty
+
+There is a bot in the firmware (`botThink`). It drives the **same virtual
+button a child does** — it calls `tryJump()` and sets `holding`, so coyote
+time, jump buffering and hold-for-height all apply to it. A bot that cheated
+past the physics would measure nothing.
+
+It does two jobs:
+
+**Attract mode.** After 5 seconds idle on the menu the bot starts playing
+behind it, arcade-style: the logo, a `DEMO` tag and a blinking prompt stay on
+top, the HUD shows the bot's live score, and everything else is the game. One
+press hands over to the child.
+
+**Measurement.** Headless on the desktop harness — no rendering — so ~1200
+games simulate in half a second:
+
+```bash
+./host/skokan --stats 400        # per-level metrics for three skill profiles
+```
+
+Skill is one knob (timing error) plus a rate of needless jumps, because those
+are exactly how a small child fails. Three profiles: `4yo`, `8yo`, `ace`.
+The table reports, per level: seconds per run, deaths/min split by cause,
+jumps/s, coins/min, and the survival curve.
+
+That table has earned its keep three times over — see
+[Learnings](#learnings) for the fall-through-solid-rock bug it found, which
+no amount of playing had revealed.
 
 ### Proving it, rather than asserting it
 

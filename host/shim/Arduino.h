@@ -58,6 +58,7 @@ inline uint32_t esp_random()          { return (uint32_t)::rand(); }
 
 extern int hostButtonLevel;    // 0 = pressed (pull-up), 1 = released
 extern int hostLedDuty;
+extern bool hostQuiet;
 
 inline void pinMode(int, int) {}
 inline void digitalWrite(int, int) {}
@@ -86,7 +87,7 @@ public:
   void   begin(unsigned long) {}
   int    available() { return 0; }
   int    read() { return -1; }
-  size_t write(uint8_t c) override { fputc(c, stdout); return 1; }
+  size_t write(uint8_t c) override { if (!hostQuiet) fputc(c, stdout); return 1; }
 };
 extern HostSerial Serial;
 
