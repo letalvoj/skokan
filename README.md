@@ -1,8 +1,28 @@
-# mluvitko
+# mluvitko / SKOKAN
 
-A talking box built on an ESP32-S3, together with an 8-year-old co-designer.
-Press the arcade button: it lights up, sings a little chiptune jingle, and
-its face reacts. Press again while it's "listening" and it shows a live
+**[▶ Play SKOKAN in your browser](https://letalvoj.github.io/skokan/)** — the
+same C++ as the box, compiled to WebAssembly.
+
+A talking box built on an ESP32-S3 together with an 8-year-old co-designer, and
+**SKOKAN** (Czech for *jumper*), the one-button neon platform runner that ended
+up living on it.
+
+The same `src/game.cpp` runs three ways: on the ESP32's 320×240 SPI panel, as a
+native macOS app, and in a browser. Only the screen, clock, button and audio are
+swapped underneath — see [host/](host/README.md).
+
+```bash
+make play    # native macOS app
+make web     # WebAssembly build
+make stats   # bot rollouts: per-level difficulty table
+make check   # fairness contract: no unclearable levels
+make flash   # build + flash the ESP32
+```
+
+## The talking box
+
+Press the arcade button: it lights up, sings a little chiptune jingle, and its
+face reacts. Press again while it's "listening" and it shows a live
 80s-radio-style spectrum of whatever's making noise nearby.
 
 ## Hardware

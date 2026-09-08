@@ -2,6 +2,7 @@
 #
 #   make play       build and launch the macOS app (SPACE to jump)
 #   make app        build SKOKAN.app only
+#   make web        build the WebAssembly version into docs/ (GitHub Pages)
 #   make icon       regenerate the app icon
 #   make stats      measured bot rollouts, per-level difficulty table
 #   make check      fairness contract: no unclearable configurations
@@ -29,7 +30,7 @@ CXXFLAGS := -std=c++17 -O2 -DGAME_HOST -DARDUINO=200 -Ihost/shim -Isrc \
 SDL      := $(shell sdl2-config --cflags 2>/dev/null)
 SDLLIBS  := $(shell sdl2-config --libs 2>/dev/null)
 
-.PHONY: play app icon stats check shots firmware flash monitor clean help
+.PHONY: play app web icon stats check shots firmware flash monitor clean help
 .DEFAULT_GOAL := help
 
 help:
@@ -69,6 +70,17 @@ $(ICNS): host/icon.cpp
 	done
 	@iconutil -c icns host/icon/AppIcon.iconset -o $@
 	@echo "built $@"
+
+# The same sources as the native app, with emscripten's SDL2 port. Output goes
+# to docs/, which is what GitHub Pages serves at letalvoj.github.io/skokan.
+web: docs/index.html
+
+docs/index.html: $(GAME_SRC) host/play.cpp host/synth_sdl.cpp host/web/shell.html
+	@command -v emcc >/dev/null || { echo "emscripten not found: brew install emscripten" >&2; exit 1; }
+	@mkdir -p docs
+	emcc $(CXXFLAGS) -I"$(GFX)" -s USE_SDL=2 -s ALLOW_MEMORY_GROWTH=1 -s ENVIRONMENT=web \
+	  $(GAME_SRC) host/play.cpp host/synth_sdl.cpp "$(GFX)/Adafruit_GFX.cpp" \
+	  --shell-file host/web/shell.html -o $@
 
 # ------------------------------------------------------------- measurement
 host/skokan: $(GAME_SRC) host/main_host.cpp host/synth_host.cpp $(wildcard host/shim/*.h)
