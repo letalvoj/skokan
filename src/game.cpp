@@ -1083,7 +1083,16 @@ static void step(float dt) {
     }
     if (wx + PLR_W - 3 > b.x && wx + 3 < b.x + BIRD_W &&
         py + PLR_H > by && py < by + BIRD_H) {
-      if (vy > 40.0f && py + PLR_H < by + BIRD_H * 0.8f) {
+      // Did you come down ONTO it? Testing where the feet ended up meant a
+      // fast fall could skip the whole stomp window in one step: the window is
+      // 8 px (BIRD_H * 0.8) but at terminal speed the runner covers ~45 px in
+      // a 60 ms frame, so it lands already below the band, the overlap still
+      // registers, and a clean stomp silently became a death. prevBottom is
+      // the feet before this frame's movement, so this asks the question that
+      // was always meant: were you above it a moment ago and falling?
+      const bool cameFromAbove = prevBottom <= by + BIRD_H * 0.7f;
+      const bool feetStillHigh = py + PLR_H < by + BIRD_H * 0.9f;
+      if (vy > 40.0f && (cameFromAbove || feetStillHigh)) {
         b.alive = false;
         vy = STOMP_V0; usedDouble = false;
         birdCombo++;
